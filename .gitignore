@@ -1,0 +1,28 @@
+# Model checkpoints
+checkpoint-400/
+s2v_old/
+# Python
+__pycache__/
+*.py[cod]
+*.class
+*.so
+.Python
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual environments
+myvenv/
+venv/
+ENV/
+
+# Frontend specific (already in frontend1/.gitignore)
+node_modules/
+.expo/
+dist/
+web-build/
+
+# IDE settings
+.idea/
+.vscode/
+.DS_Store

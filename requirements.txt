@@ -1,0 +1,20 @@
+# requirements.txt
+torch>=1.8.0
+transformers>=4.5.0
+nltk>=3.6.0
+spacy>=3.0.0
+en_core_web_sm @ https://github.com/explosion/spacy-models/releases/download/en_core_web_sm-3.0.0/en_core_web_sm-3.0.0.tar.gz
+sentence-transformers>=2.0.0
+fastapi>=0.68.0
+pydantic>=1.8.0
+uvicorn>=0.15.0
+requests>=2.25.0
+# Optional for enhanced distractor generation
+sense2vec>=1.0.3
+
+# Install instructions for sense2vec data:
+# 1. Download s2v_reddit_2015_md from https://github.com/explosion/sense2vec
+# 2. Extract and place in project directory
+# 3. Alternatively, download and extract with:
+#    python -m pip install sense2vec
+#    python -m sense2vec.cli download_reddit s2v_old
