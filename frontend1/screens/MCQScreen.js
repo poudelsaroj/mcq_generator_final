@@ -1,9 +1,11 @@
-import React from 'react';
-import { View, Text, ScrollView, StyleSheet, TouchableOpacity } from 'react-native';
+import React, { useState } from 'react';
+import { View, Text, ScrollView, StyleSheet, TouchableOpacity, Alert } from 'react-native';
 import { Ionicons } from '@expo/vector-icons';
+import { generateMCQFile } from '../utils/pdfGenerator';
 
 const MCQScreen = ({ route, navigation }) => {
   const { mcqs } = route.params;
+  const [showMCQs, setShowMCQs] = useState(false);
 
   if (!mcqs || mcqs.length === 0) {
     return (
@@ -19,11 +21,61 @@ const MCQScreen = ({ route, navigation }) => {
     );
   }
 
+  // Handle download action with format selection
+  const handleDownload = () => {
+    Alert.alert(
+      'Download MCQs',
+      'Choose a format to download',
+      [
+        {
+          text: 'PDF',
+          onPress: () => generateMCQFile(formatMCQsForDownload(mcqs), 'pdf')
+        },
+        {
+          text: 'Text File',
+          onPress: () => generateMCQFile(formatMCQsForDownload(mcqs), 'txt')
+        },
+        {
+          text: 'Cancel',
+          style: 'cancel'
+        }
+      ]
+    );
+  };
+
+  // Format MCQs to match the format expected by pdfGenerator
+  const formatMCQsForDownload = (mcqs) => {
+    return mcqs.map(mcq => ({
+      question: mcq.question,
+      answer: mcq.correct_answer,
+      distractors: mcq.options.filter(option => option !== mcq.correct_answer)
+    }));
+  };
+
   return (
     <ScrollView style={styles.container}>
-      <Text style={styles.title}>Generated MCQs</Text>
+      <View style={styles.summaryCard}>
+        <Text style={styles.title}>MCQs Generated</Text>
+        <Text style={styles.summaryText}>
+          {mcqs.length} multiple-choice questions have been successfully generated.
+        </Text>
+        <Text style={styles.instructionText}>
+          You can take an assessment with these questions or download them in your preferred format.
+        </Text>
+      </View>
       
-      {mcqs.map((mcq, index) => (
+      <TouchableOpacity 
+        style={styles.toggleButton}
+        onPress={() => setShowMCQs(!showMCQs)}
+      >
+        <Text style={styles.toggleButtonText}>
+          {showMCQs ? 'Hide MCQs' : 'Preview MCQs'}
+        </Text>
+        <Ionicons name={showMCQs ? "eye-off-outline" : "eye-outline"} size={20} color="#007AFF" />
+      </TouchableOpacity>
+      
+      {/* Only show MCQs if toggle is enabled */}
+      {showMCQs && mcqs.map((mcq, index) => (
         <View key={index} style={styles.mcqContainer}>
           <Text style={styles.questionNumber}>Question {index + 1}</Text>
           <Text style={styles.question}>{mcq.question}</Text>
@@ -47,8 +99,29 @@ const MCQScreen = ({ route, navigation }) => {
         </View>
       ))}
       
+      {/* Action buttons */}
+      <View style={styles.actionContainer}>
+        <TouchableOpacity
+          style={[styles.actionButton, styles.assessButton]}
+          onPress={() => navigation.navigate('MCQAssessment', { 
+            generatedMCQs: formatMCQsForDownload(mcqs)
+          })}
+        >
+          <Ionicons name="school-outline" size={24} color="#fff" />
+          <Text style={styles.actionButtonText}>Take Assessment</Text>
+        </TouchableOpacity>
+        
+        <TouchableOpacity
+          style={[styles.actionButton, styles.downloadButton]}
+          onPress={handleDownload}
+        >
+          <Ionicons name="download-outline" size={24} color="#fff" />
+          <Text style={styles.actionButtonText}>Download</Text>
+        </TouchableOpacity>
+      </View>
+      
       <TouchableOpacity
-        style={styles.button}
+        style={styles.homeButton}
         onPress={() => navigation.navigate('Home')}
       >
         <Text style={styles.buttonText}>Done</Text>
@@ -64,11 +137,56 @@ const styles = StyleSheet.create({
     padding: 16,
     backgroundColor: '#f5f5f5',
   },
+  summaryCard: {
+    backgroundColor: '#fff',
+    borderRadius: 8,
+    padding: 20,
+    marginBottom: 16,
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 1 },
+    shadowOpacity: 0.2,
+    shadowRadius: 2,
+    elevation: 2,
+    alignItems: 'center',
+  },
   title: {
     fontSize: 24,
     fontWeight: 'bold',
     marginBottom: 16,
     color: '#333',
+  },
+  summaryText: {
+    fontSize: 18,
+    textAlign: 'center',
+    color: '#4CAF50',
+    fontWeight: 'bold',
+    marginBottom: 8,
+  },
+  instructionText: {
+    fontSize: 16,
+    textAlign: 'center',
+    color: '#666',
+    marginTop: 8,
+  },
+  toggleButton: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    backgroundColor: '#fff',
+    padding: 12,
+    borderRadius: 8,
+    marginVertical: 16,
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 1 },
+    shadowOpacity: 0.1,
+    shadowRadius: 1,
+    elevation: 1,
+  },
+  toggleButtonText: {
+    color: '#007AFF',
+    fontWeight: '600',
+    fontSize: 16,
+    marginRight: 8,
   },
   mcqContainer: {
     backgroundColor: '#fff',
@@ -81,6 +199,7 @@ const styles = StyleSheet.create({
     shadowRadius: 2,
     elevation: 2,
   },
+  // Keep all existing styles below this line
   questionNumber: {
     fontSize: 16,
     fontWeight: 'bold',
@@ -134,14 +253,41 @@ const styles = StyleSheet.create({
     fontSize: 16,
     fontWeight: '500',
   },
-  button: {
+  actionContainer: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    marginVertical: 20,
+  },
+  actionButton: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    padding: 16,
+    borderRadius: 8,
+    flex: 1,
+  },
+  assessButton: {
+    backgroundColor: '#4CAF50',
+    marginRight: 8,
+  },
+  downloadButton: {
+    backgroundColor: '#FF9800',
+    marginLeft: 8,
+  },
+  actionButtonText: {
+    color: 'white',
+    fontWeight: 'bold',
+    fontSize: 16,
+    marginLeft: 8,
+  },
+  homeButton: {
     backgroundColor: '#007AFF',
     padding: 16,
     borderRadius: 8,
     flexDirection: 'row',
     justifyContent: 'center',
     alignItems: 'center',
-    marginVertical: 20,
+    marginBottom: 20,
   },
   buttonText: {
     color: 'white',

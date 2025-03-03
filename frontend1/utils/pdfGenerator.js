@@ -1,6 +1,7 @@
 import * as FileSystem from 'expo-file-system';
 import * as Print from 'expo-print';
 import * as Sharing from 'expo-sharing';
+import * as MediaLibrary from 'expo-media-library';
 import { Platform, Alert } from 'react-native';
 import { sampleMCQs } from '../data/sampleMCQs';
 
@@ -283,5 +284,41 @@ ${result.userAnswer !== result.correctAnswer ? `Correct Answer: ${result.correct
   } catch (error) {
     console.error('Error generating assessment report:', error);
     Alert.alert('Error', 'Failed to generate assessment report');
+  }
+};
+
+export const saveFileToDevice = async (fileUri, fileName, mimeType) => {
+  try {
+    // Request permissions first
+    const { status } = await MediaLibrary.requestPermissionsAsync();
+    if (status !== 'granted') {
+      Alert.alert('Permission needed', 'Please grant permission to save files');
+      return false;
+    }
+
+    // For iOS: Copy file to a location accessible by MediaLibrary
+    if (Platform.OS === 'ios') {
+      const directory = FileSystem.documentDirectory;
+      const destUri = `${directory}${fileName}`;
+      await FileSystem.copyAsync({
+        from: fileUri,
+        to: destUri
+      });
+      fileUri = destUri;
+    }
+
+    // Save to media library
+    const asset = await MediaLibrary.createAssetAsync(fileUri);
+    await MediaLibrary.createAlbumAsync("MCQGenerator", asset, false);
+    
+    Alert.alert(
+      'Download Complete', 
+      `File saved to your device's Downloads folder`
+    );
+    return true;
+  } catch (error) {
+    console.error('Error saving file:', error);
+    Alert.alert('Error', 'Failed to save file to your device');
+    return false;
   }
 };

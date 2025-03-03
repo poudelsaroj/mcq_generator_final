@@ -4,29 +4,14 @@ import NetInfo from '@react-native-community/netinfo';
 
 // Export this function so it can be imported in other files
 export const getBaseUrl = () => {
-  if (Platform.OS === 'android') {
-    // For Android emulator
-    return __DEV__ ? 'http://10.0.2.2:8000' : 'http://192.168.1.16:8000';
-  } else if (Platform.OS === 'ios') {
-    // For iOS simulator
-    return __DEV__ ? 'http://localhost:8000' : 'http://192.168.1.16:8000';
-  } else {
-    // For physical devices or web
-    return 'http://192.168.1.16:8000'; // Make sure this is your server's actual IP
-  }
+  // Use the direct IP address for all platforms
+  return 'http://192.168.1.16:8000'; // Replace with your actual machine's IP address
 };
 
 // Get WebSocket URL based on environment
 const getWebSocketUrl = () => {
-  if (Platform.OS === 'android') {
-    // For Android emulator
-    return 'ws://10.0.2.2:8000';
-  } else if (Platform.OS === 'ios') {
-    // For iOS simulator
-    return 'ws://localhost:8000';
-  } else {
-    return 'ws://192.168.1.16:8000'; // Update with your actual IP
-  }
+  // Use the direct IP address for WebSocket connections too
+  return 'ws://192.168.1.16:8000'; // Replace with your actual machine's IP address
 };
 
 // WebSocket connection management
@@ -190,9 +175,17 @@ export async function generateMCQsFromAPI(content, numQuestions = 5) {
   });
   
   try {
+    // Increase timeout for model computation (MCQ generation can take time)
     const timeout = new Promise((_, reject) => 
-      setTimeout(() => reject(new Error('Request timeout after 30 seconds')), 30000)
+      setTimeout(() => reject(new Error('Request timeout after 60 seconds')), 60000)
     );
+    
+    // Add debugging info in request
+    console.log('Full request URL:', `${getBaseUrl()}/generate-mcqs`);
+    console.log('Request body:', {
+      text: content.substring(0, 100) + '...',
+      num_questions: numQuestions
+    });
     
     const fetchPromise = fetch(`${getBaseUrl()}/generate-mcqs`, {
       method: 'POST',
@@ -216,12 +209,16 @@ export async function generateMCQsFromAPI(content, numQuestions = 5) {
     }
 
     const data = await response.json();
-    console.log('API response received successfully');
-    return data.mcqs;
+    console.log('API response received successfully:', data);
+    
+    // Return the mcqs array directly - this is the key change
+    return data.mcqs || [];
   } catch (error) {
     console.error('Network or API error:', error);
     
-    if (error.message.includes('Network request failed')) {
+    if (error.message.includes('timeout')) {
+      throw new Error('The server took too long to respond. Try with a shorter text or fewer questions.');
+    } else if (error.message.includes('Network request failed')) {
       throw new Error('Cannot connect to server. Please check if the server is running and try again.');
     }
     
@@ -309,3 +306,61 @@ export async function generateMCQsFromFileAPI(fileUri, fileName, fileType, numQu
     throw new Error('Failed to generate MCQs from file. Please check your connection and try again.');
   }
 }
+
+export async function testServerConnection() {
+  try {
+    const response = await fetch(`${getBaseUrl()}/health`, { 
+      method: 'GET',
+      timeout: 5000 // 5 second timeout for quick check
+    });
+    
+    if (response.ok) {
+      return { connected: true, message: 'Server is reachable' };
+    } else {
+      return { connected: false, message: `Server returned status ${response.status}` };
+    }
+  } catch (error) {
+    console.error('Server connection test failed:', error);
+    return { 
+      connected: false, 
+      message: 'Cannot connect to server',
+      error: error.message 
+    };
+  }
+}
+
+export const processFileWithOCR = async (fileUri, fileName, fileType) => {
+  try {
+    console.log('Processing file with OCR:', { fileName, fileType });
+    
+    // Read file as base64
+    const base64Data = await FileSystem.readAsStringAsync(fileUri, {
+      encoding: FileSystem.EncodingType.Base64
+    });
+    
+    const response = await fetch(`${API_BASE_URL}/process-file-ocr`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        file_content: base64Data,
+        file_name: fileName,
+        file_type: fileType,
+        force_ocr: true  // This explicitly tells the backend to use OCR
+      }),
+    });
+
+    if (!response.ok) {
+      const errorText = await response.text();
+      console.error('OCR API Error:', response.status, errorText);
+      throw new Error(`Server responded with status ${response.status}: ${errorText || 'Unknown error'}`);
+    }
+    
+    const data = await response.json();
+    return data;
+  } catch (error) {
+    console.error('Error processing file with OCR:', error);
+    throw new Error('Failed to process file with OCR. Please try again.');
+  }
+};

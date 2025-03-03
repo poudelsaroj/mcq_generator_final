@@ -27,8 +27,13 @@ const ChapterSelectionScreen = ({ route, navigation }) => {
       .map(index => chapters[index].content)
       .join('\n\n');
     
-    // Go to the number of questions screen
-    navigation.navigate('NumQuestions', { text: selectedContent });
+    // Go to the number of questions screen with proper parameters structure
+    navigation.navigate('NumQuestions', { 
+      contentType: 'text',
+      content: selectedContent,
+      fileName: fileName,
+      documentType: 'book' // Important: specify this is book content
+    });
   };
   
   return (

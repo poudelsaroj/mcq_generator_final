@@ -10,7 +10,7 @@ import { WebSocketService, processFileAPI } from '../services/apiService';
 
 const SERVER_URL = '192.168.1.16:8000'; // Update with your actual server IP
 
-const FileUploadScreen = ({ navigation }) => {
+export default function FileUploadScreen({ navigation }) {
   const [fileName, setFileName] = useState('');
   const [isLoading, setIsLoading] = useState(false);
   const [fileUri, setFileUri] = useState('');
@@ -163,35 +163,105 @@ const FileUploadScreen = ({ navigation }) => {
   };
   
   const handleUpload = async () => {
-    if (!fileUri) {
+    if (!fileUri || !fileName) {
       Alert.alert('Error', 'Please select a file first');
       return;
     }
     
-    setIsLoading(true);
-    setProcessingStatus('Connecting...');
-    
+    // Start processing immediately
+    await processFile();
+  };
+  
+  const processDocument = async (processWholeBook = false) => {
     try {
-      // Process file with API (this will use WebSocket for large files)
+      setIsLoading(true);
+      
+      // Pass document type parameter to make server aware of the type
       const result = await processFileAPI(fileUri, fileName, fileType, documentType);
       
-      // Handle result based on book or document
-      if (result.is_book && result.chapters && result.chapters.length > 1) {
-        // Show book options or go to chapter selection
-        if (documentType === 'book') {
-          setShowBookOptions(true);
-        } else {
-          navigation.navigate('ChapterSelection', {
-            chapters: result.chapters,
-            fileName: fileName
-          });
-        }
-      } else {
-        // Regular document - navigate to questions screen
-        const content = result.chapters[0].content;
+      if (processWholeBook) {
+        // Process whole book
         navigation.navigate('NumQuestions', {
           contentType: 'text',
-          content: content
+          content: result.chapters.map(chapter => chapter.content).join('\n\n'),
+          fileUri: fileUri,
+          fileName: fileName,
+          fileType: fileType,
+          documentType: "book"
+        });
+      } else {
+        // Process by chapters
+        navigation.navigate('ChapterSelection', {
+          chapters: result.chapters,
+          fileName: fileName
+        });
+      }
+    } catch (error) {
+      console.error('Error processing file:', error);
+      Alert.alert('Error', error.message || 'Failed to process file');
+    } finally {
+      setIsLoading(false);
+      setShowBookOptions(false);
+    }
+  };
+
+  const processFile = async () => {
+    if (!fileUri || !fileName) {
+      Alert.alert('Error', 'Please select a file first');
+      return;
+    }
+  
+    setIsLoading(true);
+    setProcessingStatus('Processing file...');
+  
+    try {
+      // First try with standard processing
+      const result = await processFileAPI(fileUri, fileName, fileType, documentType);
+      
+      // Check if text extraction was successful (define a minimum character threshold)
+      const extractedText = result.text || "";
+      
+      // If text extraction failed or returned very little content, try OCR
+      if (fileType.includes('pdf') && extractedText.trim().length < 100) {
+        console.log("Standard text extraction didn't work well, trying OCR...");
+        setProcessingStatus('Using OCR for better text extraction...');
+        
+        // Use enhanced OCR processing
+        const ocrResult = await processFileWithOCR(fileUri, fileName, fileType);
+        
+        // Update the result with OCR text
+        result.text = ocrResult.text;
+        
+        // Also update chapters if needed
+        if (result.chapters && result.chapters.length > 0) {
+          result.chapters[0].content = ocrResult.text;
+        }
+      }
+      
+      // For PDFs marked as books, ALWAYS show the options modal first
+      if (documentType === 'book') {
+        // Show book options modal immediately
+        setShowBookOptions(true);
+      } 
+      // If user didn't explicitly select document type but server detected book structure
+      else if (documentType !== 'document' && result.is_book && result.chapters && result.chapters.length > 1) {
+        // Show book options modal
+        setShowBookOptions(true);
+      }
+      // For regular documents, proceed directly
+      else {
+        // Regular document - navigate to questions screen
+        const content = result.chapters && result.chapters.length > 0 
+          ? result.chapters[0].content 
+          : result.text;
+        
+        navigation.navigate('NumQuestions', {
+          contentType: 'text',
+          content: content,
+          fileUri: fileUri,
+          fileName: fileName,
+          fileType: fileType,
+          documentType: 'document'
         });
       }
     } catch (error) {
@@ -202,42 +272,56 @@ const FileUploadScreen = ({ navigation }) => {
       setProcessingStatus('');
     }
   };
-  
-  const processDocument = async (processWholeBook = false) => {
-    setIsLoading(true);
-    try {
-      // Add document_type to the API call
-      const result = await processFileAPI(fileUri, fileName, fileType, documentType);
-      
-      if (result.is_book && result.chapters.length > 1 && !processWholeBook) {
-        // It's a book with multiple chapters - navigate to chapter selection
-        navigation.navigate('ChapterSelection', {
-          chapters: result.chapters,
-          fileName: fileName
-        });
-      } else {
-        // It's a regular document or whole book processing - navigate directly to question number selection
-        let content;
-        
-        if (processWholeBook && result.chapters && result.chapters.length > 0) {
-          // Combine all chapter contents for whole book processing
-          content = result.chapters.map(chapter => chapter.content).join('\n\n');
-        } else {
-          // Just use the first chapter/content
-          content = result.chapters[0].content;
-        }
-        
-        navigation.navigate('NumQuestions', {
-          contentType: 'text',
-          content: content
-        });
-      }
-    } catch (error) {
-      console.error('Error processing file:', error);
-      Alert.alert('Error', error.message || 'Failed to process file');
-    } finally {
-      setIsLoading(false);
-      setShowBookOptions(false);
+
+  const handleFileUploadSuccess = (chapters) => {
+    // Navigate to chapter selection with the chapters data
+    navigation.navigate('ChapterSelection', { 
+      chapters: chapters,
+      fileName: fileName,  // Make sure fileName is defined
+      fileUri: fileUri    // Make sure fileUri is defined
+    });
+  };
+
+  const handleFileProcessingComplete = (result) => {
+    // Check if this is a book with multiple chapters
+    if (result.is_book) {
+      // Show option dialog for book processing
+      Alert.alert(
+        "Book Processing Options",
+        "How would you like to generate MCQs?",
+        [
+          {
+            text: "Chapter-wise",
+            onPress: () => {
+              // Navigate to chapter selection screen
+              navigation.navigate('ChapterSelection', {
+                chapters: result.chapters,
+                fileName: fileName,
+                fileUri: fileUri
+              });
+            }
+          },
+          {
+            text: "Entire Book",
+            onPress: () => {
+              // Navigate directly to MCQ generation with full text
+              navigation.navigate('MCQConfiguration', {
+                text: result.text,
+                fileName: fileName,
+                source: 'file'
+              });
+            }
+          }
+        ],
+        { cancelable: false }
+      );
+    } else {
+      // For regular documents, proceed directly to MCQ configuration
+      navigation.navigate('MCQConfiguration', {
+        text: result.text,
+        fileName: fileName,
+        source: 'file'
+      });
     }
   };
 
@@ -298,52 +382,42 @@ const FileUploadScreen = ({ navigation }) => {
       </TouchableOpacity>
 
       <View style={styles.documentTypeContainer}>
-        <Text style={styles.documentTypeLabel}>Document Type:</Text>
+        <Text style={styles.sectionTitle}>Document Type:</Text>
         <View style={styles.documentTypeButtons}>
           <TouchableOpacity
             style={[
-              styles.documentTypeButton,
-              documentType === 'document' && styles.documentTypeSelected
+              styles.typeButton,
+              documentType === 'document' && styles.selectedTypeButton
             ]}
             onPress={() => setDocumentType('document')}
-            disabled={isLoading}
           >
             <Ionicons 
               name="document-text" 
               size={24} 
               color={documentType === 'document' ? "#fff" : "#007AFF"} 
             />
-            <Text 
-              style={[
-                styles.documentTypeText,
-                documentType === 'document' && styles.documentTypeTextSelected
-              ]}
-            >
-              Document
-            </Text>
+            <Text style={[
+              styles.typeButtonText,
+              documentType === 'document' && styles.selectedTypeText
+            ]}>Document</Text>
           </TouchableOpacity>
           
           <TouchableOpacity
             style={[
-              styles.documentTypeButton,
-              documentType === 'book' && styles.documentTypeSelected
+              styles.typeButton,
+              documentType === 'book' && styles.selectedTypeButton
             ]}
             onPress={() => setDocumentType('book')}
-            disabled={isLoading}
           >
             <Ionicons 
               name="book" 
               size={24} 
               color={documentType === 'book' ? "#fff" : "#007AFF"} 
             />
-            <Text 
-              style={[
-                styles.documentTypeText,
-                documentType === 'book' && styles.documentTypeTextSelected
-              ]}
-            >
-              Book
-            </Text>
+            <Text style={[
+              styles.typeButtonText,
+              documentType === 'book' && styles.selectedTypeText
+            ]}>Book</Text>
           </TouchableOpacity>
         </View>
       </View>
@@ -558,35 +632,29 @@ const styles = StyleSheet.create({
     marginRight: 8,
   },
   documentTypeContainer: {
-    flexDirection: 'row',
-    alignItems: 'center',
     marginBottom: 20,
-  },
-  documentTypeLabel: {
-    fontSize: 16,
-    color: '#333',
-    marginRight: 10,
   },
   documentTypeButtons: {
     flexDirection: 'row',
+    marginTop: 10,
   },
-  documentTypeButton: {
+  typeButton: {
     flexDirection: 'row',
     alignItems: 'center',
-    padding: 10,
-    borderRadius: 8,
     borderWidth: 1,
     borderColor: '#007AFF',
+    borderRadius: 8,
+    padding: 10,
     marginRight: 10,
   },
-  documentTypeSelected: {
+  selectedTypeButton: {
     backgroundColor: '#007AFF',
   },
-  documentTypeText: {
-    marginLeft: 5,
+  typeButtonText: {
+    marginLeft: 8,
     color: '#007AFF',
   },
-  documentTypeTextSelected: {
+  selectedTypeText: {
     color: '#fff',
   },
   // Add these new styles for the modal
@@ -656,5 +724,3 @@ const styles = StyleSheet.create({
     fontWeight: '500',
   },
 });
-
-export default FileUploadScreen;

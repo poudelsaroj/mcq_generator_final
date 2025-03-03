@@ -18,7 +18,7 @@ def print_mcq(mcq):
 
 if __name__ == "__main__":
     # Initialize the MCQ generator
-    mcq_gen = MCQGenerator(model_path="checkpoint-400")
+    mcq_gen = MCQGenerator(model_path="/media/saroj/New Volume/own/huggingface")
     
     # Example passages
     passages = [

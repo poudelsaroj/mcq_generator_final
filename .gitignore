@@ -1,6 +1,10 @@
 # Model checkpoints
 checkpoint-400/
 s2v_old/
+huggingface/
+backend/
+distractor/
+qa/
 # Python
 __pycache__/
 *.py[cod]
