@@ -54,9 +54,9 @@ const ChapterSelectionScreen = ({ route, navigation }) => {
           >
             <View style={styles.chapterContent}>
               <Text style={styles.chapterTitle}>{item.title}</Text>
-              <Text style={styles.chapterPreview}>
+              {/* <Text style={styles.chapterPreview}>
                 {item.content.substring(0, 50)}...
-              </Text>
+              </Text> */}
             </View>
             <View style={styles.checkbox}>
               {selectedChapters.includes(index) ? (

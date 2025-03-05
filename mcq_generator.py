@@ -94,7 +94,7 @@ class AnswerValidator:
     """
     def __init__(self):
         self.sbert = SentenceTransformer("all-MiniLM-L6-v2")
-        self.threshold = 0.4  # higher threshold than 0.15
+        self.threshold = 0.05  # higher threshold than 0.15
 
     def is_answer_plausible(self, question: str, answer: str, context: str) -> bool:
         # Type-check rule first
@@ -259,12 +259,72 @@ class DistractorGenerator:
         final = []
         seen = set()
         clower = correct.lower()
+        
+        # Normalize function to remove articles and standardize forms
+        def normalize(text):
+            # Remove leading articles
+            text = re.sub(r'^(a|an|the)\s+', '', text.lower())
+            # Lemmatize to handle plurals/singulars using spacy
+            doc = nlp(text)
+            lemmas = [token.lemma_ for token in doc]
+            return " ".join(lemmas)
+        
+        # Get normalized correct answer for comparison
+        normalized_correct = normalize(correct)
+        
         for c in cands:
+            # Skip empty candidates
+            if not c.strip():
+                continue
+                
             dlow = c.lower()
-            if dlow not in seen and clower not in dlow:
+            normalized_c = normalize(c)
+            
+            # Check if this is a duplicate or too similar to correct answer
+            if (normalized_c not in seen and 
+                normalized_c != normalized_correct and
+                clower not in dlow and
+                dlow not in clower and
+                not self._is_minimal_variation(c, [correct] + final)):
+                
                 final.append(c)
-                seen.add(dlow)
+                seen.add(normalized_c)
+        
         return final
+
+    def _is_minimal_variation(self, candidate: str, existing_items: List[str]) -> bool:
+        """Check if candidate is just a minimal variation of existing items."""
+        import Levenshtein
+        
+        # Normalize to lowercase for comparison
+        candidate = candidate.lower()
+        
+        for item in existing_items:
+            item = item.lower()
+            
+            # Skip if they are entirely different
+            if not (candidate in item or item in candidate):
+                # Check if they're very similar with Levenshtein distance
+                if len(item) > 3 and len(candidate) > 3:
+                    # Calculate normalized edit distance
+                    max_len = max(len(item), len(candidate))
+                    if max_len == 0:
+                        continue
+                        
+                    distance = Levenshtein.distance(item, candidate)
+                    normalized_distance = distance / max_len
+                    
+                    # If very similar (less than 20% different)
+                    if normalized_distance < 0.2:
+                        return True
+            else:
+                # One string contains the other
+                # If they're almost the same length, it's likely just a minimal difference
+                len_diff = abs(len(item) - len(candidate))
+                if len_diff <= 3:  # Only small differences like "a" or "the" or "s"
+                    return True
+                    
+        return False
 
     def _re_rank_distractors(self, cands: List[str], correct: str, context: str, top_k: int) -> List[str]:
         if not cands:
@@ -286,6 +346,28 @@ class DistractorGenerator:
         results.sort(key=lambda x: x[1], reverse=True)
         top = [r[0] for r in results[:top_k]]
         return top
+
+    def _filter_distractors(self, distractors: List[str], correct: str, question: str) -> List[str]:
+        """Filter out low-quality distractors."""
+        filtered = []
+        correct_lower = correct.lower()
+        
+        # Check similarity using embeddings
+        correct_emb = self.sbert.encode(correct, convert_to_tensor=True)
+        dist_embs = self.sbert.encode(distractors, convert_to_tensor=True)
+        similarities = util.cos_sim(dist_embs, correct_emb)
+        
+        for i, dist in enumerate(distractors):
+            dist_lower = dist.lower()
+            sim = float(similarities[i])
+            
+            # Check if distractor is too similar or too different from correct answer
+            if 0.3 < sim < 0.85 and dist_lower != correct_lower:
+                # Check if distractor length is reasonable
+                if 0.3 < len(dist)/len(correct) < 3:
+                    filtered.append(dist)
+                    
+        return filtered
 
     def generate_distractors(self, question: str, correct_answer: str, context: str, num_distractors: int = 3) -> List[str]:
         # 1) T5 local (with up to 5 sequences)
@@ -412,6 +494,35 @@ class MCQGenerator:
                 pass
         return {"question": "Could not parse question", "answer": keyp}
 
+    def _generate_why_how_question(self, sentence: str) -> Dict[str, str]:
+        """Generate why/how questions that test deeper understanding."""
+        doc = nlp(sentence)
+        has_cause = any(token.dep_ == "advcl" for token in doc)
+        
+        if has_cause:
+            input_text = f"Generate a 'why' question from: {sentence} </s>"
+        else:
+            input_text = f"Generate a 'how' question from: {sentence} </s>"
+            
+        inputs = self.qg_tokenizer([input_text], return_tensors="pt", 
+                                  max_length=512, truncation=True).to(self.device)
+        # Rest of generation code...
+
+    def _generate_qa_with_context(self, sentence: str, text: str) -> Dict[str, str]:
+        """Generate QA using the target sentence and surrounding context."""
+        sents = split_into_sentences(text)
+        try:
+            idx = sents.index(sentence)
+            start = max(0, idx - 1)
+            end = min(len(sents), idx + 2)
+            context = " ".join(sents[start:end])
+        except:
+            context = sentence
+            
+        # Now use this expanded context for generation
+        input_text = f"context: {context} answer: [MASK] </s>"
+        # Rest of your generation code...
+
     def _validate_build_mcq(self, question: str, answer: str, context: str) -> Dict[str, Any]:
         """
         1) Check SBERT + type-check => if fail => dummy
@@ -455,18 +566,97 @@ class MCQGenerator:
         }
 
     def _score_mcq(self, mcq: Dict[str, Any]) -> float:
-        """
-        Re-rank final MCQs by simple heuristics:
-          +1 if question has >6 words
-          +1 if correct_answer != "No valid answer"
-        """
+        """Enhanced scoring for better question selection."""
         score = 0
-        qwords = mcq["question"].split()
+        question = mcq["question"]
+        answer = mcq["correct_answer"]
+        
+        # Reward question words
+        if any(qw in question.lower() for qw in ["what", "why", "how", "which", "where", "when"]):
+            score += 2
+            
+        # Reward non-trivial questions (longer than 6 words)
+        qwords = question.split()
         if len(qwords) > 6:
             score += 1
-        if "no valid answer" not in mcq["correct_answer"].lower():
+            
+        # Reward questions with specific entities (names, places, etc.)
+        q_doc = nlp(question)
+        if len(q_doc.ents) > 0:
+            score += 2
+            
+        # Penalize "no valid answer"
+        if "no valid answer" in answer.lower():
+            score -= 5
+            
+        # Reward diverse option lengths (avoids obvious answers)
+        option_lengths = [len(opt) for opt in mcq["options"]]
+        if max(option_lengths) - min(option_lengths) < 10:
             score += 1
+            
         return float(score)
+
+    def _select_key_sentences(self, text: str, count: int) -> List[str]:
+        """Select important sentences based on multiple factors."""
+        sents = split_into_sentences(text)
+        if len(sents) <= count:
+            return sents
+            
+        # Calculate TF-IDF to identify important terms
+        from sklearn.feature_extraction.text import TfidfVectorizer
+        vectorizer = TfidfVectorizer(stop_words='english')
+        try:
+            tfidf_matrix = vectorizer.fit_transform(sents)
+            importance_scores = tfidf_matrix.sum(axis=1).A1
+        except:
+            # Fallback to length-based if TF-IDF fails
+            importance_scores = [len(s.split()) for s in sents]
+        
+        # Add scores for sentences with named entities
+        for i, sent in enumerate(sents):
+            doc = nlp(sent)
+            if len(doc.ents) > 0:
+                importance_scores[i] += 2  # Bonus for sentences with entities
+        
+        # Add scores for sentences with key content markers
+        keywords = ["important", "significant", "key", "main", "crucial", "essential"]
+        for i, sent in enumerate(sents):
+            if any(kw in sent.lower() for kw in keywords):
+                importance_scores[i] += 1
+                
+        # Get top sentences
+        top_indices = sorted(range(len(importance_scores)), 
+                            key=lambda i: importance_scores[i], 
+                            reverse=True)[:count*2]
+        top_indices.sort()  # Keep original order
+        return [sents[i] for i in top_indices]
+
+    def _select_question_type(self, sentence, story_elements):
+        """Choose appropriate question type based on sentence content."""
+        doc = nlp(sentence)
+        
+        # Look for cause-effect relationships for "why" questions
+        has_causal = any(token.dep_ == "advcl" for token in doc)
+        
+        # Look for action verbs for "how" questions
+        has_action = any(token.pos_ == "VERB" and token.dep_ == "ROOT" for token in doc)
+        
+        # Look for character names for "who" questions
+        has_character = any(ent.label_ == "PERSON" for ent in doc.ents)
+        
+        # Look for locations for "where" questions
+        has_location = any(ent.label_ == "LOC" or ent.label_ == "GPE" for ent in doc.ents)
+        
+        if has_causal:
+            return "why"
+        elif has_action:
+            return "how"
+        elif has_character:
+            return "who"
+        elif has_location:
+            return "where"
+        else:
+            return "what"  # Default
 
     def generate_multiple_mcqs(self, text: str, user_requested_count: int) -> List[Dict[str, Any]]:
         """
@@ -477,13 +667,10 @@ class MCQGenerator:
         5) re-rank => pick top user_requested_count
         """
         # step1: pick top user_requested_count*2 sentences by length
-        sents = split_into_sentences(text)
-        scored_sents = [(s, len(s.split())) for s in sents]
-        scored_sents.sort(key=lambda x: x[1], reverse=True)
-        top_sents = [x[0] for x in scored_sents[:user_requested_count * 2]]
+        sents = self._select_key_sentences(text, user_requested_count * 2)
 
         mcqs = []
-        for sent in top_sents:
+        for sent in sents:
             # approach 1: masked
             qaA = self._generate_qa_masked(sent)
             mcqA = self._validate_build_mcq(qaA["question"], qaA["answer"], sent)
