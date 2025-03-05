@@ -24,7 +24,7 @@ mcq_generator = MCQGenerator(
 # CORS for dev – adjust in production
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # In production, replace with specific origins
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -212,194 +212,111 @@ async def websocket_file_endpoint(websocket: WebSocket, client_id: str):
 # Add this helper function to detect chapters in text
 def detect_chapters(text):
     """
-    Enhanced chapter detection that specifically handles TOC with page numbers
-    and finds chapter boundaries based on content structure.
+    Enhanced chapter detection using multiple strategies to identify chapter boundaries
+    in various document types and formats.
     """
     import re
     from collections import Counter
-    import nltk
-    from nltk.tokenize import sent_tokenize
     
-    # Download nltk resources if needed
-    try:
-        nltk.data.find('tokenizers/punkt')
-    except LookupError:
-        nltk.download('punkt')
-    
-    # Split text into lines for analysis
-    lines = text.split('\n')
-    
-    # 1. First Strategy: Find and utilize Table of Contents
-    toc_patterns = [
-        r'(?i)^\s*table\s+of\s+contents\s*$',
-        r'(?i)^\s*contents\s*$'
+    # More comprehensive chapter heading patterns
+    chapter_patterns = [
+        # Standard chapter headings
+        r'(?i)^\s*chapter\s+(\d+|[ivxlcdm]+)[\s\.:]*(.*)$',  # Chapter 1: Title
+        r'(?i)^\s*section\s+(\d+|[ivxlcdm]+)[\s\.:]*(.*)$',  # Section 1: Title
+        r'(?i)^\s*part\s+(\d+|[ivxlcdm]+)[\s\.:]*(.*)$',     # Part I: Title
+        r'(?i)^\s*unit\s+(\d+|[ivxlcdm]+)[\s\.:]*(.*)$',     # Unit 1: Title
+        
+        # Numbered headings
+        r'^\s*(\d+)[\.\s]+([\p{Lu}][\p{L}\s].*)$',           # 1. Title or 1 Title
+        r'^\s*(\d+\.\d+)[\.\s]+([\p{Lu}][\p{L}\s].*)$',      # 1.1 Title (subsections)
+        
+        # Roman numerals as headings
+        r'^\s*([IVXLCDM]+)[\.\s]+([\p{Lu}][\p{L}\s].*)$',    # IV. TITLE
+        
+        # Special formats
+        r'^\s*LESSON\s+(\d+|[IVXLCDM]+)[\s\.:]*(.*)$',       # LESSON 1: Title
+        r'^\s*LECTURE\s+(\d+|[IVXLCDM]+)[\s\.:]*(.*)$',      # LECTURE 1: Title
+        r'^\s*MODULE\s+(\d+|[IVXLCDM]+)[\s\.:]*(.*)$',       # MODULE 1: Title
+        
+        # Appendices and supplementary sections
+        r'(?i)^\s*appendix\s+([a-z]|[IVXLCDM]+)[\s\.:]*(.*)$',  # Appendix A: Title
+        r'(?i)^\s*annex\s+([a-z]|[IVXLCDM]+)[\s\.:]*(.*)$',     # Annex I: Title
     ]
     
-    toc_index = -1
+    # Split the text into lines for analysis
+    lines = text.split('\n')
+    
+    # First pass - identify potential chapter headings
+    potential_chapters = []
     for i, line in enumerate(lines):
-        for pattern in toc_patterns:
-            if re.match(pattern, line.strip()):
-                toc_index = i
-                print(f"[DEBUG] Found table of contents at line {i}: '{line}'")
+        line = line.strip()
+        if not line:
+            continue
+        
+        for pattern in chapter_patterns:
+            if re.match(pattern, line, re.MULTILINE | re.UNICODE):
+                # Look for clues that this is really a heading:
+                # 1. Short line (headings are usually short)
+                # 2. Previous line might be empty
+                # 3. Current line might have different formatting (ALL CAPS, etc.)
+                is_short_line = len(line) < 100
+                prev_line_empty = i > 0 and not lines[i-1].strip()
+                is_capitalized = line.isupper() or (line[0:1].isupper() if line else False)
+                
+                score = 0
+                if is_short_line: score += 2
+                if prev_line_empty: score += 1
+                if is_capitalized: score += 1
+                
+                if score >= 2:  # Threshold for considering a line as a chapter heading
+                    potential_chapters.append((i, line, score))
                 break
-        if toc_index >= 0:
-            break
     
-    chapters = []
-    
-    # If we found a TOC, use it to identify chapters and their locations
-    if toc_index >= 0:
-        # Extract chapter entries with page numbers from TOC
-        # Format like: "Chapter 1: Introduction ........... 3"
-        toc_chapter_pattern = r'(?i)(?:chapter|part|section)\s+(\d+|[ivxlcdm]+)[^0-9]+?(\d+)$'
-        toc_entries = []
+    # If no potential chapters found through patterns, try structural analysis
+    if not potential_chapters:
+        # Look for formatting clues like consistent line spacing or style
+        line_lengths = [len(line.strip()) for line in lines if line.strip()]
+        avg_length = sum(line_lengths) / max(len(line_lengths), 1)
         
-        # Look at a reasonable number of lines after TOC heading
-        for i in range(toc_index + 1, min(toc_index + 50, len(lines))):
-            line = lines[i].strip()
-            if not line:
-                continue
-                
-            match = re.search(toc_chapter_pattern, line)
-            if match:
-                chapter_num = match.group(1)
-                page_num = match.group(2)
-                # Extract title (everything between chapter number and page number)
-                title_match = re.search(rf'(?i)(?:chapter|part|section)\s+{chapter_num}[^0-9]+', line)
-                title = line[title_match.end():].strip() if title_match else ""
-                title = re.sub(r'\.+\s*\d+\s*$', '', title).strip()  # Remove trailing dots and page number
-                
-                full_title = f"Chapter {chapter_num}{': ' + title if title else ''}"
-                toc_entries.append((chapter_num, page_num, full_title))
-                print(f"[DEBUG] TOC entry: Chapter {chapter_num}, Page {page_num}, Title: {title}")
-        
-        # If we found entries in the TOC, try to locate them in the document
-        if toc_entries:
-            # Simple but effective page boundary detection
-            # Look for page numbers that might indicate page boundaries
-            page_markers = []
-            page_pattern = r'^\s*(\d+)\s*$'  # Plain number on a line by itself
-            
-            for i, line in enumerate(lines):
-                match = re.match(page_pattern, line.strip())
-                if match:
-                    page_markers.append((i, int(match.group(1))))
-            
-            # Sort by page number
-            page_markers.sort(key=lambda x: x[1])
-            
-            # Try to correlate TOC entries with page boundaries
-            for chapter_num, page_num, title in toc_entries:
-                page_num = int(page_num)
-                # Find the first page marker with this page number or greater
-                for line_idx, marker_page in page_markers:
-                    if marker_page >= page_num:
-                        # Found potential chapter start based on page number
-                        # Look around this point for chapter heading
-                        search_range = 15  # Lines to search around the page marker
-                        
-                        # Look for chapter heading pattern near the page marker
-                        chapter_pattern = rf'(?i)chapter\s+{chapter_num}\s*[:.]?'
-                        found_heading = False
-                        
-                        # Search before the page marker first (more common in PDFs)
-                        for j in range(max(0, line_idx - search_range), line_idx + search_range):
-                            if j < len(lines) and re.search(chapter_pattern, lines[j]):
-                                start_idx = j
-                                found_heading = True
-                                print(f"[DEBUG] Found Chapter {chapter_num} at line {j} based on page {page_num}")
-                                break
-                        
-                        # If we couldn't find heading pattern, use the page marker itself
-                        if not found_heading:
-                            start_idx = line_idx
-                            print(f"[DEBUG] Using page marker at line {line_idx} for Chapter {chapter_num}")
-                        
-                        # Find where this chapter ends (next chapter or end of doc)
-                        end_idx = len(lines)
-                        
-                        # Look for the next chapter in TOC entries
-                        for next_num, next_page, _ in toc_entries:
-                            if int(next_page) > page_num:
-                                # Find the page marker for the next chapter
-                                for next_line_idx, next_marker_page in page_markers:
-                                    if next_marker_page >= int(next_page):
-                                        end_idx = next_line_idx
-                                        break
-                                break
-                        
-                        # Extract chapter content
-                        chapter_content = '\n'.join(lines[start_idx:end_idx]).strip()
-                        
-                        # Only add chapter if it has enough content
-                        if len(chapter_content) > 200:
-                            chapters.append({
-                                "title": title,
-                                "content": chapter_content
-                            })
-                        break
-        
-        # If we found at least 2 chapters through TOC, we're done
-        if len(chapters) >= 2:
-            print(f"[DEBUG] Successfully located {len(chapters)} chapters using TOC page numbers")
-            return chapters
-    
-    # 2. Second Strategy: Pattern-based chapter detection
-    if not chapters:
-        print("[DEBUG] TOC detection failed, falling back to pattern matching")
-        # Your existing pattern detection code
-        # (Keep all the existing patterns and logic)
-        chapter_patterns = [
-            r'(?i)^\s*chapter\s+(\d+)\s*:\s*(.*?)$',               # Chapter 1 : Title (with space)
-            r'(?i)^\s*chapter\s+(\d+)\s*$',                         # Chapter N alone
-            r'(?i)^chapter\s+(\d+)\s*:',                            # Chapter N: without space constraint
-            r'(?i)^\s*chapter\s+(\d+|[ivxlcdm]+)[\s\.:]*(.*)$',     # Standard chapter formats
-            # ... [your existing patterns] ...
-        ]
-        
-        potential_chapters = []
         for i, line in enumerate(lines):
             line = line.strip()
             if not line:
                 continue
             
-            for pattern in chapter_patterns:
-                if re.match(pattern, line, re.MULTILINE | re.UNICODE):
-                    score = 5  # Higher base score for confident patterns
-                    potential_chapters.append((i, line, score))
-                    break
-        
-        if potential_chapters:
-            # Process potential chapters into actual chapters
-            for idx, (line_idx, heading, _) in enumerate(potential_chapters):
-                start_idx = line_idx
-                end_idx = potential_chapters[idx + 1][0] if idx + 1 < len(potential_chapters) else len(lines)
-                
-                chapter_content = '\n'.join([heading] + lines[start_idx + 1:end_idx])
-                if len(chapter_content) > 200:
-                    chapters.append({
-                        "title": heading,
-                        "content": chapter_content
-                    })
-            
-            if len(chapters) >= 2:
-                print(f"[DEBUG] Pattern detection found {len(chapters)} chapters")
-                return chapters
+            # Check if this line is significantly shorter than average
+            # and followed by longer content (potential heading)
+            if len(line) < avg_length * 0.5 and i < len(lines) - 1 and len(lines[i+1].strip()) > avg_length:
+                if line[0:1].isupper():  # First letter capitalized
+                    potential_chapters.append((i, line, 1))  # Lower score for structural detection
     
-    # 3. Final Strategy: Create artificial chapters
-    if not chapters:
-        print("[DEBUG] All detection methods failed, creating artificial chapters")
-        # Modify this part to create at least 2 chapters but not too many
-        max_chapter_size = 5000  # Characters per chapter
-        total_length = len(text)
+    # If still no chapters found or too few, fall back to content-based segmentation
+    if len(potential_chapters) <= 1:
+        # Create artificial chapters based on content size
+        return create_artificial_chapters(text)
+    
+    # Extract actual chapter text based on identified headings
+    chapters = []
+    for idx, (line_idx, heading, _) in enumerate(potential_chapters):
+        start_idx = line_idx
+        end_idx = potential_chapters[idx + 1][0] if idx + 1 < len(potential_chapters) else len(lines)
         
-        # Create at least 2 chapters, but not more than 5 by default
-        num_chapters = min(max(2, total_length // max_chapter_size), 5)
-        return create_artificial_chapters(text, max_chapter_size, num_chapters=num_chapters)
+        chapter_title = heading.strip()
+        chapter_content = '\n' + '\n'.join([heading] + lines[start_idx + 1:end_idx])
+        
+        # Skip very short chapters that might be false positives
+        if len(chapter_content.strip()) > 200:
+            chapters.append({
+                "title": chapter_title,
+                "content": chapter_content.strip()
+            })
+    
+    # If we identified headings but didn't get valid chapters, fall back to simpler approach
+    if not chapters:
+        return [{"title": "Chapter 1", "content": text}]
     
     return chapters
 
-def create_artificial_chapters(text, max_chapter_size=200, num_chapters=5):
+def create_artificial_chapters(text, max_chapter_size=5000):
     """Create artificial chapters if natural chapters can't be detected"""
     chapters = []
     # Split into chunks of approximately max_chapter_size characters
@@ -407,6 +324,7 @@ def create_artificial_chapters(text, max_chapter_size=200, num_chapters=5):
     if total_length <= max_chapter_size:
         return [{"title": "Chapter 1", "content": text}]
     
+    num_chapters = max(3, total_length // max_chapter_size)
     chapter_size = total_length // num_chapters
     
     for i in range(num_chapters):
@@ -475,5 +393,5 @@ def generate_mcqs_from_file(file_input: FileInput):
         raise HTTPException(status_code=500, detail=f"MCQ generation from file failed: {str(e)}")
 
 @app.get("/health")
-async def health_check():
-    return {"status": "ok", "version": "1.0"}
+def health_check():
+    return {"status": "ok"}

@@ -1,20 +1,18 @@
 import { Platform } from 'react-native';
 import * as FileSystem from 'expo-file-system';
 import NetInfo from '@react-native-community/netinfo';
-import { getApiUrl, getWebSocketUrl } from '../config';
 
-// Use the imported functions directly - no need to redefine them
-// Remove these redundant functions:
-// export const getBaseUrl = () => {
-//   return getApiUrl();
-// };
-// 
-// const getWebSocketUrl = () => {
-//   return getWebSocketUrl();
-// };
+// Export this function so it can be imported in other files
+export const getBaseUrl = () => {
+  // Use the direct IP address for all platforms
+  return 'http://192.168.1.16:8000'; // Replace with your actual machine's IP address
+};
 
-// Instead, use them directly:
-export const getBaseUrl = getApiUrl;
+// Get WebSocket URL based on environment
+const getWebSocketUrl = () => {
+  // Use the direct IP address for WebSocket connections too
+  return 'ws://192.168.1.16:8000'; // Replace with your actual machine's IP address
+};
 
 // WebSocket connection management
 export class WebSocketService {
