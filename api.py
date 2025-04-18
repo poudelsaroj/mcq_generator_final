@@ -18,7 +18,7 @@ file_processor = FileProcessor(ocr_enabled=True)
 mcq_generator = MCQGenerator(
     qa_model_path="./qa",
     distractor_model_path="./distractor",
-    openrouter_api_key=""
+    openrouter_api_key="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"
 )
 
 # CORS for dev – adjust in production

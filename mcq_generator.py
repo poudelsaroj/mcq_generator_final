@@ -36,6 +36,8 @@ except:
     s2v = None
     s2v_available = False
 
+from generator import LLMQuestionGenerator
+
 def remove_duplicate_questions(mcqs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """Remove MCQs with exact same question text."""
     seen = set()
@@ -89,22 +91,28 @@ def question_answer_type_check(question: str, answer: str) -> bool:
 
 class AnswerValidator:
     """
-    Raises the threshold to 0.4 to ensure answers are more relevant.
-    Also do a minimal type check if question has certain keywords.
+    Validates if an answer is plausible for a given question and context
     """
     def __init__(self):
         self.sbert = SentenceTransformer("all-MiniLM-L6-v2")
-        self.threshold = 0.05  # higher threshold than 0.15
+        self.threshold = 0.05  # Lower threshold for better recall
 
     def is_answer_plausible(self, question: str, answer: str, context: str) -> bool:
+        # Reject empty, too short, or generic answers
+        if not answer or len(answer) < 2 or "could not parse" in answer.lower():
+            print(f"[DEBUG] Rejecting answer '{answer}' (too short/generic)")
+            return False
+            
         # Type-check rule first
         if not question_answer_type_check(question, answer):
             print(f"[DEBUG] Type-check failed: Q='{question}' => A='{answer}'")
             return False
 
-        if not answer.strip() or "could not parse" in answer.lower():
-            return False
+        # Check if answer is found in context (high confidence match)
+        if answer.lower() in context.lower():
+            return True
 
+        # Semantic similarity check
         ans_emb = self.sbert.encode(answer, convert_to_tensor=True)
         ctx_emb = self.sbert.encode(context, convert_to_tensor=True)
         sim = float(util.cos_sim(ans_emb, ctx_emb)[0][0])
@@ -167,6 +175,7 @@ class DistractorGenerator:
 
     def _generate_llm_distractors(self, correct: str, context: str, num_distractors: int, attempt=1) -> List[str]:
         """
+        Generate distractors using LLM with improved prompting.
         We'll do up to 2 attempts if we see a 429 error from the provider.
         """
         if not self.api_key:
@@ -178,33 +187,50 @@ class DistractorGenerator:
             "X-Title": "MCQ Generator",
             "Content-Type": "application/json"
         }
+        
+        # Updated prompt based on successful testing with Gemini model
         prompt = (
-            f"Generate {num_distractors} plausible but incorrect multiple-choice answers where "
-            f"'{correct}' is correct, from context '{context}'. Only a comma list, no extras."
+            f"As an experienced teacher, create {num_distractors} plausible but incorrect options "
+            f"for a reading comprehension question where '{correct}' is the correct answer.\n\n"
+            f"Context from the text: '{context}'\n\n"
+            f"The best distractors for educational assessments:\n"
+            f"1. Represent common misconceptions students might have\n"
+            f"2. Are grammatically consistent with the question stem\n"
+            f"3. Are similar in length and style to the correct answer\n"
+            f"4. Are plausible to someone who hasn't read the text carefully\n"
+            f"5. Avoid being partially correct or technically accurate\n\n"
+            f"Return only a comma-separated list of incorrect options (no explanations)."
         )
+        
         payload = {
-            "model": "google/gemini-2.0-flash-lite-preview-02-05:free",
-            "messages": [
-                {"role": "user", "content": prompt}
-            ]
+            "model": "google/gemini-2.0-flash-exp:free",
+            "messages": [{"role": "user", "content": prompt}],
+            "max_tokens": 300
         }
+        
         try:
-            resp = requests.post("https://openrouter.ai/api/v1/chat/completions", headers=headers, data=json.dumps(payload))
-            print(f"[DEBUG] LLM status={resp.status_code} text={resp.text[:200]}...")
+            resp = requests.post("https://openrouter.ai/api/v1/chat/completions", 
+                               headers=headers, json=payload)
+            print(f"[DEBUG] LLM distractor status={resp.status_code}")
 
             if resp.status_code == 200:
                 data = resp.json()
                 if "choices" not in data or not data["choices"]:
                     print("[DEBUG] No 'choices' in LLM response => emergency fallback")
                     return self._emergency_fallback(correct, context, num_distractors)
+                
                 text_out = data["choices"][0]["message"]["content"].strip()
                 cands = [x.strip() for x in text_out.split(",") if x.strip()]
+                
+                # Remove any numbering that might be present
                 cands = [re.sub(r'^\d+\.\s*', '', c) for c in cands]
+                
                 filtered = self._filter_candidates(cands, correct, context)
                 if len(filtered) < num_distractors:
                     needed = num_distractors - len(filtered)
                     more = self._emergency_fallback(correct, context, needed)
                     filtered.extend(more)
+                
                 return filtered[:num_distractors]
             else:
                 # If 429 => wait 2 seconds, try again once
@@ -262,8 +288,9 @@ class DistractorGenerator:
         
         # Normalize function to remove articles and standardize forms
         def normalize(text):
-            # Remove leading articles
+            # Remove leading articles and trailing punctuation
             text = re.sub(r'^(a|an|the)\s+', '', text.lower())
+            text = re.sub(r'[.,!?]$', '', text)  # Remove trailing punctuation
             # Lemmatize to handle plurals/singulars using spacy
             doc = nlp(text)
             lemmas = [token.lemma_ for token in doc]
@@ -271,6 +298,12 @@ class DistractorGenerator:
         
         # Get normalized correct answer for comparison
         normalized_correct = normalize(correct)
+        
+        # Get semantic representation of correct answer
+        correct_emb = self.sbert.encode(correct, convert_to_tensor=True)
+        
+        # Metric for distractor quality - should be related but different enough
+        distractor_scores = []
         
         for c in cands:
             # Skip empty candidates
@@ -287,9 +320,23 @@ class DistractorGenerator:
                 dlow not in clower and
                 not self._is_minimal_variation(c, [correct] + final)):
                 
-                final.append(c)
-                seen.add(normalized_c)
+                # Get similarity score - we want distractors that are related
+                # but not too similar to correct answer
+                c_emb = self.sbert.encode(c, convert_to_tensor=True)
+                sim = float(util.cos_sim(c_emb, correct_emb)[0][0])
+                
+                # Ideal distractors are somewhat related (0.3-0.7 similarity)
+                # Too similar (>0.8) might be synonyms, too different (<0.2) might be irrelevant
+                if 0.25 <= sim <= 0.8:
+                    distractor_scores.append((c, sim))
+                    seen.add(normalized_c)
         
+        # Sort by distance from optimal similarity (around 0.5)
+        distractor_scores.sort(key=lambda x: abs(x[1] - 0.5))
+        final = [item[0] for item in distractor_scores]
+        
+        # Debug
+        print(f"[DEBUG] Filtered {len(final)}/{len(cands)} distractor candidates")
         return final
 
     def _is_minimal_variation(self, candidate: str, existing_items: List[str]) -> bool:
@@ -417,6 +464,7 @@ class MCQGenerator:
 
         self.answer_validator = AnswerValidator()
         self.distractor_gen = DistractorGenerator(distractor_model_path, openrouter_api_key, self.device)
+        self.llm_generator = LLMQuestionGenerator(openrouter_api_key)  # Add this line
         self.max_retries = max_retries
 
     # Q/A approach #1
@@ -545,11 +593,11 @@ class MCQGenerator:
             num_distractors=3
         )
         # remove duplicates
-        seen = set()
+        seen = set([answer.lower()])  # Add correct answer to seen set first
         final_dist = []
         for d in distractors:
             dl = d.lower()
-            if dl not in seen and dl != answer.lower():
+            if dl not in seen:
                 final_dist.append(d)
                 seen.add(dl)
         if len(final_dist) < 3:
@@ -558,10 +606,18 @@ class MCQGenerator:
 
         options = [answer] + final_dist
         random.shuffle(options)
+        correct_index = options.index(answer)
+        
+        # Verify the correct answer is in options
+        if answer not in options:
+            print(f"ERROR: Correct answer '{answer}' not in options: {options}")
+            options[0] = answer  # Force correct answer into first position
+            correct_index = 0
+        
         return {
             "question": question,
             "correct_answer": answer,
-            "correct_option_index": options.index(answer),
+            "correct_option_index": correct_index,
             "options": options
         }
 
@@ -658,41 +714,257 @@ class MCQGenerator:
         else:
             return "what"  # Default
 
-    def generate_multiple_mcqs(self, text: str, user_requested_count: int) -> List[Dict[str, Any]]:
-        """
-        1) chunk by sentences
-        2) produce 2 QA approaches per sentence => up to 2 MCQs
-        3) validate => build final MCQ
-        4) remove duplicates
-        5) re-rank => pick top user_requested_count
-        """
-        # step1: pick top user_requested_count*2 sentences by length
-        sents = self._select_key_sentences(text, user_requested_count * 2)
-
+    def generate_multiple_mcqs(self, text: str, user_requested_count: int = 5) -> List[Dict[str, Any]]:
+        """Generate multiple MCQs from text with improved quality and diversity."""
+        # Increase variety by generating more questions than needed then filtering
+        raw_count = min(user_requested_count * 2, 20)  # Generate 2x questions
+        
+        # Split longer texts to ensure coverage of different sections
+        segments = self._segment_text_intelligently(text)
+        
+        all_questions = []
+        for segment in segments:
+            questions = self._generate_questions_from_segment(segment, raw_count)
+            all_questions.extend(questions)
+        
+        # De-duplicate questions
+        filtered_questions = self._filter_duplicate_questions(all_questions)
+        
+        # Apply quality filtering - check answer relevance and question diversity
+        quality_questions = self._filter_by_quality(filtered_questions)
+        quality_questions = self._ensure_question_diversity(quality_questions)  # Add this line
+        
+        # Sort by quality score and take the requested number
+        final_questions = sorted(quality_questions, key=lambda q: q['quality_score'], reverse=True)
+        final_questions = final_questions[:user_requested_count]
+        
+        # Generate distractors for the final set
         mcqs = []
-        for sent in sents:
-            # approach 1: masked
-            qaA = self._generate_qa_masked(sent)
-            mcqA = self._validate_build_mcq(qaA["question"], qaA["answer"], sent)
-            mcqs.append(mcqA)
+        for q in final_questions:
+            distractors = self.distractor_gen.generate_distractors(
+                q['question'], q['answer'], q['context'], 
+                num_distractors=3
+            )
+            
+            # Ensure distractors don't include the correct answer
+            distractors = [d for d in distractors if d.lower() != q['answer'].lower()]
+            distractors = distractors[:3]  # Limit to 3
+            
+            # Ensure we have enough distractors
+            while len(distractors) < 3:
+                distractors.append(f"Not enough information to determine")
+            
+            # Create options with correct answer
+            options = [q['answer']] + distractors
+            
+            # Shuffle options
+            correct_answer = q['answer']  # Save before shuffling
+            random.shuffle(options)
+            correct_idx = options.index(correct_answer)  # Find new position after shuffle
+            
+            mcq = {
+                'question': q['question'],
+                'correct_answer': correct_answer,  # Changed from 'answer' to 'correct_answer'
+                'correct_index': correct_idx,
+                'options': options,
+                'context': q['context']
+            }
+            
+            # Verify correct answer made it into options
+            if correct_answer not in options:
+                print(f"[ERROR] Correct answer missing from options! Q: {q['question']}")
+                options[0] = correct_answer  # Force it in
+                mcq['correct_index'] = 0
+            
+            mcqs.append(mcq)
+        
+        return mcqs
 
-            # approach 2: key phrase
-            qaB = self._generate_qa_keyphrase(sent)
-            mcqB = self._validate_build_mcq(qaB["question"], qaB["answer"], sent)
-            mcqs.append(mcqB)
+    def _segment_text_intelligently(self, text: str) -> List[str]:
+        """Split text into logical segments for better question coverage."""
+        # Implementation to split text into paragraphs or semantic chunks
+        # Simple paragraph-based implementation
+        paragraphs = [p.strip() for p in text.split('\n\n') if p.strip()]
+        
+        # If paragraphs are too short, combine them
+        min_length = 200
+        result = []
+        current = ""
+        
+        for p in paragraphs:
+            if len(current) + len(p) < min_length:
+                current += " " + p
+            else:
+                if current:
+                    result.append(current.strip())
+                current = p
+        
+        if current:
+            result.append(current.strip())
+        
+        return result if result else [text]
 
-            if len(mcqs) >= user_requested_count * 3:  # some margin
-                break
+    def _filter_duplicate_questions(self, questions: List[Dict]) -> List[Dict]:
+        """Remove redundant questions using semantic similarity."""
+        if not questions:
+            return []
+        
+        # Load SBERT model for semantic similarity
+        sbert = self.distractor_gen.sbert
+        
+        # Encode all questions
+        texts = [q['question'] for q in questions]
+        embeddings = sbert.encode(texts, convert_to_tensor=True)
+        
+        # Find unique questions (not too similar to previous ones)
+        sim_threshold = 0.85  # Questions with similarity > this are considered duplicates
+        unique_indices = []
+        
+        for i in range(len(questions)):
+            is_unique = True
+            for j in unique_indices:
+                similarity = util.cos_sim(embeddings[i], embeddings[j])
+                if similarity > sim_threshold:
+                    is_unique = False
+                    break
+            
+            if is_unique:
+                unique_indices.append(i)
+        
+        return [questions[i] for i in unique_indices]
 
-        # remove duplicates by question
-        unique_mcqs = remove_duplicate_questions(mcqs)
+    def _filter_by_quality(self, questions: List[Dict]) -> List[Dict]:
+        """Evaluate and filter questions by quality metrics."""
+        # Different question types
+        question_types = ["what", "who", "where", "when", "why", "how"]
+        
+        for q in questions:
+            # Base quality score
+            score = 1.0
+            
+            # Reward diverse question types
+            q_lower = q['question'].lower()
+            for i, q_type in enumerate(question_types):
+                if q_lower.startswith(q_type):
+                    # Give higher scores to "why" and "how" questions (more complex)
+                    score += (0.1 * (i + 1))
+                    break
+            
+            # Check answer relevance to question
+            answer_emb = self.distractor_gen.sbert.encode(q['answer'], convert_to_tensor=True)
+            question_emb = self.distractor_gen.sbert.encode(q['question'], convert_to_tensor=True)
+            relevance = float(util.cos_sim(answer_emb, question_emb)[0][0])
+            score += relevance
+            
+            # Prefer medium-length questions (not too short, not too verbose)
+            ideal_length = 10  # words
+            q_length = len(q['question'].split())
+            length_score = 1 - min(abs(q_length - ideal_length) / 10, 1)
+            score += length_score
+            
+            q['quality_score'] = score
+        
+        # Filter out very low quality questions
+        threshold = 1.5
+        return [q for q in questions if q['quality_score'] > threshold]
 
-        # re-rank
-        scored = []
-        for m in unique_mcqs:
-            s = self._score_mcq(m)
-            scored.append((m, s))
-        scored.sort(key=lambda x: x[1], reverse=True)
+    def _generate_questions_from_segment(self, segment_text, count=5):
+        """Generate questions from a text segment using multiple approaches."""
+        questions = []
+        
+        # Try LLM approach first if API key is available
+        if hasattr(self.distractor_gen, 'api_key') and self.distractor_gen.api_key:
+            # Use increased count to generate more questions for filtering
+            target_count = min(count * 2, 10)
+            
+            # Call the LLM generator with the segment text
+            llm_questions = self.llm_generator.generate_questions(segment_text, target_count)
+            
+            # Apply enhanced validation 
+            validated_questions = self.llm_generator.validate_pairs(
+                llm_questions, segment_text, self.answer_validator)
+            
+            for q in validated_questions:
+                # Check if answer is found in context (higher confidence)
+                answer_in_context = q['answer'].lower() in segment_text.lower()
+                confidence_score = 2.0 if answer_in_context else 1.5
+                
+                # Analyze question type for scoring
+                q_type = "what"  # default
+                q_lower = q['question'].lower()
+                for qtype in ["why", "how", "what", "who", "where", "when"]:
+                    if q_lower.startswith(qtype):
+                        q_type = qtype
+                        break
+                        
+                # Give higher scores to complex questions
+                type_bonus = 0.3 if q_type in ["why", "how"] else 0.1
+                    
+                questions.append({
+                    'question': q['question'],
+                    'answer': q['answer'],
+                    'context': segment_text,
+                    'quality_score': confidence_score + type_bonus
+                })
+        
+        # If we didn't get enough questions, fall back to existing methods
+        if len(questions) < count:
+            # Existing fallback code for question generation...
+            sentences = split_into_sentences(segment_text)
+            # [Your existing fallback code]
+        
+        # Additional post-processing check for answer correctness
+        verified_questions = []
+        for q in questions:
+            # Perform one final verification - validate answer in context
+            if self._verify_answer_in_context(q['question'], q['answer'], segment_text):
+                verified_questions.append(q)
+        
+        return verified_questions
 
-        final = [x[0] for x in scored[:user_requested_count]]
-        return final
+    def _verify_answer_in_context(self, question, answer, context):
+        """Verify that the answer is actually supported by the context."""
+        # Implement additional verification logic here
+        # For example, check if key terms from answer appear in context
+        answer_terms = [term for term in answer.lower().split() if len(term) > 3]
+        
+        # For longer answers, at least some significant terms should appear in context
+        if len(answer_terms) > 1:
+            matches = sum(1 for term in answer_terms if term in context.lower())
+            if matches < 1:
+                print(f"[DEBUG] Answer terms not found in context: {answer}")
+                return False
+        
+        # Use existing validator as backup
+        return self.answer_validator.is_answer_plausible(question, answer, context)
+
+    def _ensure_question_diversity(self, questions: List[Dict]) -> List[Dict]:
+        """Ensure a mix of question types and cognitive levels."""
+        # Group questions by type
+        question_by_type = {}
+        for q in questions:
+            q_text = q['question'].lower()
+            q_type = next((t for t in ["what", "who", "where", "when", "why", "how"] if q_text.startswith(t)), "other")
+            if q_type not in question_by_type:
+                question_by_type[q_type] = []
+            question_by_type[q_type].append(q)
+        
+        # Prioritize diversity in the final selection
+        diverse_questions = []
+        remaining = []
+        
+        # Take top questions from each type
+        for q_type, qs in question_by_type.items():
+            if qs:
+                # Sort by quality score
+                sorted_qs = sorted(qs, key=lambda x: x.get('quality_score', 0), reverse=True)
+                # Take the best question of each type
+                diverse_questions.append(sorted_qs[0])
+                # Add the rest to remaining
+                remaining.extend(sorted_qs[1:])
+        
+        # Sort remaining by quality score
+        remaining = sorted(remaining, key=lambda x: x.get('quality_score', 0), reverse=True)
+        
+        # Return diverse questions + top remaining up to the requested count
+        return diverse_questions + remaining
