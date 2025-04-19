@@ -36,7 +36,13 @@ except:
     s2v = None
     s2v_available = False
 
-from generator import LLMQuestionGenerator
+import concurrent.futures
+
+# # Import LLM components from generator.py
+# from generator import LLMQuestionGenerator, DistractorGeneratorLLM
+
+# Import advanced components from generator.py
+from generator import EnhancedQuestionGenerator, OnlineDistractionGenerator
 
 def remove_duplicate_questions(mcqs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """Remove MCQs with exact same question text."""
@@ -121,18 +127,20 @@ class AnswerValidator:
 
 class DistractorGenerator:
     """
-    T5 => if <3 => LLM => if <3 => sense2vec => if <3 => emergency
-    + generats up to 5 T5 distractors to reduce fallback usage.
-    + retries LLM once if code=429 (ex: usage limit).
+    T5 => if <3 =>  if <3 => sense2vec => if <3 => emergency
+    + generates up to 5 T5 distractors to reduce fallback usage.
+    + retries Google API once if code=429 (ex: usage limit).
     """
 
-    def __init__(self, distractor_model_path: str, openrouter_api_key: str, device: str):
+    def __init__(self, distractor_model_path: str, google_api_key: str, device: str):
         self.device = device
         print(f"[DEBUG] Loading T5 distractor from: {os.path.abspath(distractor_model_path)}")
         self.dist_tokenizer = AutoTokenizer.from_pretrained(distractor_model_path)
         self.dist_model = AutoModelForSeq2SeqLM.from_pretrained(distractor_model_path).to(self.device)
-        self.api_key = openrouter_api_key
+        self.api_key = google_api_key  # Store as api_key for internal use
         self.sbert = SentenceTransformer("all-MiniLM-L6-v2")
+        # Initialize the online distractor generator
+        self.online_distractor_gen = OnlineDistractionGenerator(api_key=google_api_key)
 
     def _generate_t5_distractors(self, question: str, correct: str, context: str) -> List[str]:
         # We request up to 5 sequences
@@ -174,76 +182,63 @@ class DistractorGenerator:
         return final
 
     def _generate_llm_distractors(self, correct: str, context: str, num_distractors: int, attempt=1) -> List[str]:
-        """
-        Generate distractors using LLM with improved prompting.
-        We'll do up to 2 attempts if we see a 429 error from the provider.
-        """
-        if not self.api_key:
-            return self._emergency_fallback(correct, context, num_distractors)
+        
+        # Use the LLM distractor generator implemented in generator.py
+        cands = self.llm_distractor_gen.generate_llm_distractors(
+            correct, context, num_distractors, attempt)
+        
+        # Filter candidates as before
+        filtered = self._filter_candidates(cands, correct, context)
+        if len(filtered) < num_distractors:
+            needed = num_distractors - len(filtered)
+            more = self._emergency_fallback(correct, context, needed)
+            filtered.extend(more)
+        
+        return filtered[:num_distractors]
 
-        headers = {
-            "Authorization": f"Bearer {self.api_key}",
-            "HTTP-Referer": "https://mcq-generator.app",
-            "X-Title": "MCQ Generator",
-            "Content-Type": "application/json"
-        }
+    def _generate_online_distractors(self, correct: str, context: str, num_distractors: int, attempt=1) -> List[str]:
+        """Generate distractors using Google API with minimal filtering."""
+        # Use the online distractor generator implemented in generator.py
+        cands = self.online_distractor_gen.generate_online_distractors(
+            correct, context, num_distractors, attempt)
         
-        # Updated prompt based on successful testing with Gemini model
-        prompt = (
-            f"As an experienced teacher, create {num_distractors} plausible but incorrect options "
-            f"for a reading comprehension question where '{correct}' is the correct answer.\n\n"
-            f"Context from the text: '{context}'\n\n"
-            f"The best distractors for educational assessments:\n"
-            f"1. Represent common misconceptions students might have\n"
-            f"2. Are grammatically consistent with the question stem\n"
-            f"3. Are similar in length and style to the correct answer\n"
-            f"4. Are plausible to someone who hasn't read the text carefully\n"
-            f"5. Avoid being partially correct or technically accurate\n\n"
-            f"Return only a comma-separated list of incorrect options (no explanations)."
-        )
-        
-        payload = {
-            "model": "google/gemini-2.0-flash-exp:free",
-            "messages": [{"role": "user", "content": prompt}],
-            "max_tokens": 300
-        }
-        
-        try:
-            resp = requests.post("https://openrouter.ai/api/v1/chat/completions", 
-                               headers=headers, json=payload)
-            print(f"[DEBUG] LLM distractor status={resp.status_code}")
-
-            if resp.status_code == 200:
-                data = resp.json()
-                if "choices" not in data or not data["choices"]:
-                    print("[DEBUG] No 'choices' in LLM response => emergency fallback")
-                    return self._emergency_fallback(correct, context, num_distractors)
-                
-                text_out = data["choices"][0]["message"]["content"].strip()
-                cands = [x.strip() for x in text_out.split(",") if x.strip()]
-                
-                # Remove any numbering that might be present
-                cands = [re.sub(r'^\d+\.\s*', '', c) for c in cands]
-                
-                filtered = self._filter_candidates(cands, correct, context)
-                if len(filtered) < num_distractors:
-                    needed = num_distractors - len(filtered)
-                    more = self._emergency_fallback(correct, context, needed)
-                    filtered.extend(more)
-                
+        if len(cands) >= num_distractors:
+            # Trust LLM output with minimal filtering
+            # Just check for basic issues like duplicates and identical matches
+            filtered = []
+            seen = set([correct.lower()])  # Add correct answer to seen set first
+            
+            for cand in cands:
+                cand_lower = cand.lower()
+                if cand_lower not in seen and cand_lower != correct.lower():
+                    filtered.append(cand)
+                    seen.add(cand_lower)
+                    if len(filtered) >= num_distractors:
+                        break
+                        
+            # Only if we have enough after this minimal filtering, return directly
+            if len(filtered) >= num_distractors:
                 return filtered[:num_distractors]
-            else:
-                # If 429 => wait 2 seconds, try again once
-                if resp.status_code == 429 and attempt < 2:
-                    print("[DEBUG] LLM got 429 => sleeping 2s and retrying once more.")
-                    time.sleep(2)
-                    return self._generate_llm_distractors(correct, context, num_distractors, attempt=2)
-
-                return self._emergency_fallback(correct, context, num_distractors)
-
-        except Exception as e:
-            print(f"[DEBUG] LLM exception: {e}")
-            return self._emergency_fallback(correct, context, num_distractors)
+        
+        # If we don't have enough after minimal filtering, then try standard filtering
+        filtered = self._filter_candidates(cands, correct, context)
+        if len(filtered) < num_distractors:
+            needed = num_distractors - len(filtered)
+            # Try to get more from LLM with another attempt before using emergency
+            if attempt < 2:
+                # Try again with LLM
+                print(f"[DEBUG] Not enough distractors ({len(filtered)}), retrying LLM")
+                more_cands = self.online_distractor_gen.generate_online_distractors(
+                    correct, context, needed, attempt + 1)
+                more_filtered = self._filter_candidates(more_cands, correct, context)
+                filtered.extend(more_filtered)
+            
+            # Only use emergency fallback if absolutely necessary
+            if len(filtered) < num_distractors:
+                more = self._emergency_fallback(correct, context, num_distractors - len(filtered))
+                filtered.extend(more)
+        
+        return filtered[:num_distractors]
 
     def _sense2vec_wordnet(self, correct: str, context: str, num: int) -> List[str]:
         cands = []
@@ -333,6 +328,7 @@ class DistractorGenerator:
         
         # Sort by distance from optimal similarity (around 0.5)
         distractor_scores.sort(key=lambda x: abs(x[1] - 0.5))
+        
         final = [item[0] for item in distractor_scores]
         
         # Debug
@@ -341,31 +337,15 @@ class DistractorGenerator:
 
     def _is_minimal_variation(self, candidate: str, existing_items: List[str]) -> bool:
         """Check if candidate is just a minimal variation of existing items."""
-        import Levenshtein
-        
-        # Normalize to lowercase for comparison
-        candidate = candidate.lower()
-        
         for item in existing_items:
-            item = item.lower()
-            
-            # Skip if they are entirely different
-            if not (candidate in item or item in candidate):
-                # Check if they're very similar with Levenshtein distance
-                if len(item) > 3 and len(candidate) > 3:
-                    # Calculate normalized edit distance
-                    max_len = max(len(item), len(candidate))
-                    if max_len == 0:
-                        continue
-                        
-                    distance = Levenshtein.distance(item, candidate)
-                    normalized_distance = distance / max_len
-                    
-                    # If very similar (less than 20% different)
-                    if normalized_distance < 0.2:
+            # Check if edit distance is very small
+            if abs(len(item) - len(candidate)) <= 2:
+                # Simple check for differing by just one character
+                if len(item) == len(candidate):
+                    diff_chars = sum(1 for a, b in zip(item.lower(), candidate.lower()) if a != b)
+                    if diff_chars <= 2:  # Differs by at most 2 chars
                         return True
-            else:
-                # One string contains the other
+                
                 # If they're almost the same length, it's likely just a minimal difference
                 len_diff = abs(len(item) - len(candidate))
                 if len_diff <= 3:  # Only small differences like "a" or "the" or "s"
@@ -417,54 +397,38 @@ class DistractorGenerator:
         return filtered
 
     def generate_distractors(self, question: str, correct_answer: str, context: str, num_distractors: int = 3) -> List[str]:
-        # 1) T5 local (with up to 5 sequences)
+        """Generate distractors, prioritizing online LLM API for speed and quality."""
+        # Start with online API if available
+        if hasattr(self, 'api_key') and self.api_key:
+            online_distractors = self._generate_online_distractors(correct_answer, context, num_distractors)
+            if online_distractors:  # Return immediately if we have results
+                return online_distractors[:num_distractors]
+        
+        # Only fall back to T5 if online generation failed
         t5_raw = self._generate_t5_distractors(question, correct_answer, context)
         filtered = self._filter_candidates(t5_raw, correct_answer, context)
-        # If <3 => LLM
-        if len(filtered) < num_distractors:
-            llm = self._generate_llm_distractors(correct_answer, context, num_distractors)
-            return llm
-        else:
-            # re-rank T5
-            final_t5 = self._re_rank_distractors(filtered, correct_answer, context, top_k=num_distractors)
-            if len(final_t5) < num_distractors:
-                # fallback LLM
-                llm = self._generate_llm_distractors(correct_answer, context, num_distractors)
-                if len(llm) < num_distractors:
-                    # sense2vec
-                    return self._sense2vec_wordnet(correct_answer, context, num_distractors)
-                return llm
-            return final_t5
-
+        
+        if len(filtered) >= num_distractors:
+            return filtered[:num_distractors]  # Skip re-ranking for speed
+        
+        # Last resort: sense2vec/wordnet
+        return self._sense2vec_wordnet(correct_answer, context, num_distractors)
 
 class MCQGenerator:
-    """
-    Enhanced pipeline:
-    1) chunk text => top sentences
-    2) for each sentence => two Q/A approaches:
-       - [MASK]
-       - Key phrase
-    3) validate Q/A with:
-       - higher SBERT threshold
-       - minimal question->answer type check
-    4) T5 distractors => LLM => sense2vec => emergency
-    5) remove duplicates, re-rank, return top user_requested_count
-    """
-
     def __init__(self,
                  qa_model_path: str = "./qa",
                  distractor_model_path: str = "./distractor",
-                 openrouter_api_key: str = "",
+                 google_api_key: str = "AIzaSyCU4rOg50EuqY5MFm76-Wz9jLkwnOd9AQA",
                  max_retries: int = 2):
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
-
+        
         print(f"[DEBUG] Loading QA model from {os.path.abspath(qa_model_path)}")
         self.qg_tokenizer = AutoTokenizer.from_pretrained(qa_model_path)
         self.qg_model = AutoModelForSeq2SeqLM.from_pretrained(qa_model_path).to(self.device)
 
         self.answer_validator = AnswerValidator()
-        self.distractor_gen = DistractorGenerator(distractor_model_path, openrouter_api_key, self.device)
-        self.llm_generator = LLMQuestionGenerator(openrouter_api_key)  # Add this line
+        self.distractor_gen = DistractorGenerator(distractor_model_path, google_api_key, self.device)
+        self.online_generator = EnhancedQuestionGenerator(google_api_key)
         self.max_retries = max_retries
 
     # Q/A approach #1
@@ -716,209 +680,136 @@ class MCQGenerator:
 
     def generate_multiple_mcqs(self, text: str, user_requested_count: int = 5) -> List[Dict[str, Any]]:
         """Generate multiple MCQs from text with improved quality and diversity."""
-        # Increase variety by generating more questions than needed then filtering
-        raw_count = min(user_requested_count * 2, 20)  # Generate 2x questions
-        
-        # Split longer texts to ensure coverage of different sections
-        segments = self._segment_text_intelligently(text)
-        
         all_questions = []
-        for segment in segments:
-            questions = self._generate_questions_from_segment(segment, raw_count)
-            all_questions.extend(questions)
         
-        # De-duplicate questions
-        filtered_questions = self._filter_duplicate_questions(all_questions)
+        # Skip segmentation for LLM - send complete text for better context understanding
+        if hasattr(self.distractor_gen, 'api_key') and self.distractor_gen.api_key:
+            try:
+                print(f"[DEBUG] Attempting LLM generation for complete text...")
+                enhanced_questions = self.online_generator.generate_questions(
+                    text, user_requested_count * 1.5)  # Request extra questions for filtering
+                
+                if enhanced_questions:
+                    # Apply minimal validation - trust LLM output more
+                    validated_questions = []
+                    for q in enhanced_questions:
+                        # Simple validation - skip semantic validation for speed
+                        if q['answer'] and len(q['answer']) >= 2 and q['answer'].lower() in text.lower():
+                            validated_questions.append({
+                                'question': q['question'],
+                                'answer': q['answer'],
+                                'context': text,
+                                'quality_score': 3.0,  # Higher score for LLM questions
+                                'source': 'llm'
+                            })
+                    
+                    if len(validated_questions) >= user_requested_count:
+                        # We have enough questions from LLM, proceed directly to MCQ creation
+                        final_questions = validated_questions[:user_requested_count]
+                        return self._convert_to_mcqs(final_questions)
+            except Exception as e:
+                print(f"[DEBUG] LLM generation error: {e}")
         
-        # Apply quality filtering - check answer relevance and question diversity
-        quality_questions = self._filter_by_quality(filtered_questions)
-        quality_questions = self._ensure_question_diversity(quality_questions)  # Add this line
+        # Fall back to traditional methods only if LLM didn't produce enough
+        segments = self._segment_text_intelligently(text)
+        fallback_questions = self._process_segments_batch(segments, user_requested_count)
         
-        # Sort by quality score and take the requested number
-        final_questions = sorted(quality_questions, key=lambda q: q['quality_score'], reverse=True)
-        final_questions = final_questions[:user_requested_count]
+        # Use simple deduplication instead of expensive semantic similarity
+        seen_questions = set()
+        unique_fallbacks = []
+        for q in fallback_questions:
+            q_lower = q['question'].lower()
+            if q_lower not in seen_questions:
+                unique_fallbacks.append(q)
+                seen_questions.add(q_lower)
         
-        # Generate distractors for the final set
-        mcqs = []
-        for q in final_questions:
+        final_questions = unique_fallbacks[:user_requested_count]
+        return self._convert_to_mcqs(final_questions)
+
+    def _convert_to_mcqs(self, questions):
+        """Helper method to convert questions to MCQs with options"""
+        final_mcqs = []
+        for q in questions:
             distractors = self.distractor_gen.generate_distractors(
-                q['question'], q['answer'], q['context'], 
-                num_distractors=3
-            )
-            
-            # Ensure distractors don't include the correct answer
-            distractors = [d for d in distractors if d.lower() != q['answer'].lower()]
-            distractors = distractors[:3]  # Limit to 3
-            
-            # Ensure we have enough distractors
-            while len(distractors) < 3:
-                distractors.append(f"Not enough information to determine")
-            
-            # Create options with correct answer
+                q['question'], q['answer'], q['context'], 3)
+                
             options = [q['answer']] + distractors
-            
-            # Shuffle options
-            correct_answer = q['answer']  # Save before shuffling
             random.shuffle(options)
-            correct_idx = options.index(correct_answer)  # Find new position after shuffle
             
             mcq = {
-                'question': q['question'],
-                'correct_answer': correct_answer,  # Changed from 'answer' to 'correct_answer'
-                'correct_index': correct_idx,
-                'options': options,
-                'context': q['context']
+                "question": q['question'],
+                "correct_answer": q['answer'],
+                "options": options,
+                "correct_option_index": options.index(q['answer']),
+                "context": q['context']
             }
-            
-            # Verify correct answer made it into options
-            if correct_answer not in options:
-                print(f"[ERROR] Correct answer missing from options! Q: {q['question']}")
-                options[0] = correct_answer  # Force it in
-                mcq['correct_index'] = 0
-            
-            mcqs.append(mcq)
+            final_mcqs.append(mcq)
         
-        return mcqs
-
-    def _segment_text_intelligently(self, text: str) -> List[str]:
-        """Split text into logical segments for better question coverage."""
-        # Implementation to split text into paragraphs or semantic chunks
-        # Simple paragraph-based implementation
-        paragraphs = [p.strip() for p in text.split('\n\n') if p.strip()]
-        
-        # If paragraphs are too short, combine them
-        min_length = 200
-        result = []
-        current = ""
-        
-        for p in paragraphs:
-            if len(current) + len(p) < min_length:
-                current += " " + p
-            else:
-                if current:
-                    result.append(current.strip())
-                current = p
-        
-        if current:
-            result.append(current.strip())
-        
-        return result if result else [text]
-
-    def _filter_duplicate_questions(self, questions: List[Dict]) -> List[Dict]:
-        """Remove redundant questions using semantic similarity."""
-        if not questions:
-            return []
-        
-        # Load SBERT model for semantic similarity
-        sbert = self.distractor_gen.sbert
-        
-        # Encode all questions
-        texts = [q['question'] for q in questions]
-        embeddings = sbert.encode(texts, convert_to_tensor=True)
-        
-        # Find unique questions (not too similar to previous ones)
-        sim_threshold = 0.85  # Questions with similarity > this are considered duplicates
-        unique_indices = []
-        
-        for i in range(len(questions)):
-            is_unique = True
-            for j in unique_indices:
-                similarity = util.cos_sim(embeddings[i], embeddings[j])
-                if similarity > sim_threshold:
-                    is_unique = False
-                    break
-            
-            if is_unique:
-                unique_indices.append(i)
-        
-        return [questions[i] for i in unique_indices]
-
-    def _filter_by_quality(self, questions: List[Dict]) -> List[Dict]:
-        """Evaluate and filter questions by quality metrics."""
-        # Different question types
-        question_types = ["what", "who", "where", "when", "why", "how"]
-        
-        for q in questions:
-            # Base quality score
-            score = 1.0
-            
-            # Reward diverse question types
-            q_lower = q['question'].lower()
-            for i, q_type in enumerate(question_types):
-                if q_lower.startswith(q_type):
-                    # Give higher scores to "why" and "how" questions (more complex)
-                    score += (0.1 * (i + 1))
-                    break
-            
-            # Check answer relevance to question
-            answer_emb = self.distractor_gen.sbert.encode(q['answer'], convert_to_tensor=True)
-            question_emb = self.distractor_gen.sbert.encode(q['question'], convert_to_tensor=True)
-            relevance = float(util.cos_sim(answer_emb, question_emb)[0][0])
-            score += relevance
-            
-            # Prefer medium-length questions (not too short, not too verbose)
-            ideal_length = 10  # words
-            q_length = len(q['question'].split())
-            length_score = 1 - min(abs(q_length - ideal_length) / 10, 1)
-            score += length_score
-            
-            q['quality_score'] = score
-        
-        # Filter out very low quality questions
-        threshold = 1.5
-        return [q for q in questions if q['quality_score'] > threshold]
+        return final_mcqs
 
     def _generate_questions_from_segment(self, segment_text, count=5):
         """Generate questions from a text segment using multiple approaches."""
         questions = []
         
-        # Try LLM approach first if API key is available
+        # Try enhanced approach first if API key is available
         if hasattr(self.distractor_gen, 'api_key') and self.distractor_gen.api_key:
-            # Use increased count to generate more questions for filtering
-            target_count = min(count * 2, 10)
-            
-            # Call the LLM generator with the segment text
-            llm_questions = self.llm_generator.generate_questions(segment_text, target_count)
-            
-            # Apply enhanced validation 
-            validated_questions = self.llm_generator.validate_pairs(
-                llm_questions, segment_text, self.answer_validator)
-            
-            for q in validated_questions:
-                # Check if answer is found in context (higher confidence)
-                answer_in_context = q['answer'].lower() in segment_text.lower()
-                confidence_score = 2.0 if answer_in_context else 1.5
+            try:
+                print(f"[DEBUG] Calling online generator for text: {segment_text[:50]}...")
+                enhanced_questions = self.online_generator.generate_questions(segment_text, count)
                 
-                # Analyze question type for scoring
-                q_type = "what"  # default
-                q_lower = q['question'].lower()
-                for qtype in ["why", "how", "what", "who", "where", "when"]:
-                    if q_lower.startswith(qtype):
-                        q_type = qtype
-                        break
-                        
-                # Give higher scores to complex questions
-                type_bonus = 0.3 if q_type in ["why", "how"] else 0.1
+                if not enhanced_questions:
+                    print(f"[DEBUG] Online generator returned no questions, falling back")
+                else:
+                    print(f"[DEBUG] Online generator returned {len(enhanced_questions)} questions")
                     
-                questions.append({
-                    'question': q['question'],
-                    'answer': q['answer'],
-                    'context': segment_text,
-                    'quality_score': confidence_score + type_bonus
-                })
+                    # Apply enhanced validation 
+                    validated_questions = self.online_generator.validate_pairs(
+                        enhanced_questions, segment_text, self.answer_validator)
+                    
+                    for q in validated_questions:
+                        questions.append({
+                            'question': q['question'],
+                            'answer': q['answer'],
+                            'context': segment_text,
+                            'quality_score': 2.0  # Enhanced questions get higher base score
+                        })
+            except Exception as e:
+                print(f"[DEBUG] Error using online generator: {e}")
         
-        # If we didn't get enough questions, fall back to existing methods
+        # FALLBACK: If we still don't have enough questions, use local generation methods
         if len(questions) < count:
-            # Existing fallback code for question generation...
+            print(f"[DEBUG] Falling back to local question generation methods")
             sentences = split_into_sentences(segment_text)
-            # [Your existing fallback code]
+            top_sentences = self._select_key_sentences(segment_text, count*2)
+            
+            for sent in top_sentences[:count*2]:
+                # Generate using mask approach
+                qa1 = self._generate_qa_masked(sent)
+                if self.answer_validator.is_answer_plausible(qa1['question'], qa1['answer'], sent):
+                    questions.append({
+                        'question': qa1['question'], 
+                        'answer': qa1['answer'],
+                        'context': segment_text,
+                        'quality_score': 1.0
+                    })
+                
+                # Generate using keyphrase approach
+                qa2 = self._generate_qa_keyphrase(sent)
+                if self.answer_validator.is_answer_plausible(qa2['question'], qa2['answer'], sent):
+                    questions.append({
+                        'question': qa2['question'], 
+                        'answer': qa2['answer'],
+                        'context': segment_text,
+                        'quality_score': 1.0
+                    })
+                    
+                # Exit early if we have enough
+                if len(questions) >= count*2:
+                    break
         
-        # Additional post-processing check for answer correctness
-        verified_questions = []
-        for q in questions:
-            # Perform one final verification - validate answer in context
-            if self._verify_answer_in_context(q['question'], q['answer'], segment_text):
-                verified_questions.append(q)
+        # Verify and return results
+        verified_questions = [q for q in questions if self._verify_answer_in_context(
+            q['question'], q['answer'], segment_text)]
         
         return verified_questions
 
@@ -968,3 +859,91 @@ class MCQGenerator:
         
         # Return diverse questions + top remaining up to the requested count
         return diverse_questions + remaining
+
+    def _process_segments_batch(self, segments, count_per_segment):
+        """Process segments in parallel for better performance."""
+        # First try with concurrent futures, but fall back to sequential if that fails
+        try:
+            with concurrent.futures.ThreadPoolExecutor() as executor:
+                futures = []
+                for segment in segments:
+                    futures.append(
+                        executor.submit(self._generate_questions_from_segment, segment, count_per_segment)
+                    )
+                
+                # Collect results as they complete
+                all_questions = []
+                for future in concurrent.futures.as_completed(futures):
+                    try:
+                        segment_questions = future.result()
+                        if segment_questions:
+                            all_questions.extend(segment_questions)
+                    except Exception as e:
+                        print(f"[DEBUG] Error processing segment: {str(e)}")
+                        
+                return all_questions
+        except Exception as e:
+            print(f"[DEBUG] Error in parallel processing, falling back to sequential: {str(e)}")
+            # Fall back to sequential processing if concurrent fails
+            all_questions = []
+            for segment in segments:
+                try:
+                    segment_questions = self._generate_questions_from_segment(segment, count_per_segment)
+                    if segment_questions:
+                        all_questions.extend(segment_questions)
+                except Exception as e:
+                    print(f"[DEBUG] Error processing segment sequentially: {str(e)}")
+            return all_questions
+
+    def _is_similar_question(self, question1, question2):
+        """Check if two questions are semantically similar to avoid duplicates."""
+        # Simple text matching
+        if question1.lower() == question2.lower():
+            return True
+            
+        # Check for substring containment
+        if question1.lower() in question2.lower() or question2.lower() in question1.lower():
+            return True
+        
+        # Use SBERT for more sophisticated matching
+        q1_emb = self.distractor_gen.sbert.encode(question1, convert_to_tensor=True)
+        q2_emb = self.distractor_gen.sbert.encode(question2, convert_to_tensor=True)
+        similarity = float(util.cos_sim(q1_emb, q2_emb)[0][0])
+        
+        # Higher threshold for considering questions similar
+        return similarity > 0.8
+
+    def _segment_text_intelligently(self, text: str) -> List[str]:
+        """
+        Split text into logical segments for better question generation.
+        Tries to keep related sentences together while limiting segment size.
+        """
+        # First split into sentences
+        sentences = split_into_sentences(text)
+        
+        # For very short texts, return the whole text as a single segment
+        if len(sentences) <= 5:
+            return [text]
+        
+        # For longer texts, segment into logical chunks
+        segments = []
+        current_segment = []
+        current_length = 0
+        max_segment_length = 1000  # Characters
+        
+        for sentence in sentences:
+            # If adding this sentence would make segment too long, start a new segment
+            # Unless this is the first sentence in the segment
+            if current_length + len(sentence) > max_segment_length and current_segment:
+                segments.append(" ".join(current_segment))
+                current_segment = [sentence]
+                current_length = len(sentence)
+            else:
+                current_segment.append(sentence)
+                current_length += len(sentence)
+        
+        # Don't forget the last segment
+        if current_segment:
+            segments.append(" ".join(current_segment))
+        
+        return segments

@@ -18,7 +18,7 @@ file_processor = FileProcessor(ocr_enabled=True)
 mcq_generator = MCQGenerator(
     qa_model_path="./qa",
     distractor_model_path="./distractor",
-    openrouter_api_key="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"
+    google_api_key="AIzaSyCU4rOg50EuqY5MFm76-Wz9jLkwnOd9AQA"  # Use Google key instead of OpenRouter
 )
 
 # CORS for dev – adjust in production
@@ -433,7 +433,11 @@ def generate_mcqs(mcq_input: MCQInput):
             text=mcq_input.text,
             user_requested_count=mcq_input.num_questions
         )
-        return {"mcqs": mcqs}
+        
+        # Add this debug code
+        print(f"[DEBUG] API returning {len(mcqs) if mcqs else 0} MCQs")
+        
+        return {"mcqs": mcqs}  # Make sure mcqs is not None
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"MCQ generation failed: {str(e)}")
 

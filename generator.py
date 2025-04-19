@@ -2,102 +2,117 @@ import json
 import requests
 from typing import List, Dict, Any
 import concurrent.futures
+import time
+import re
 
-class LLMQuestionGenerator:
-    """
-    Uses LLMs via OpenRouter API to generate high-quality questions and answers
-    from provided text context.
-    """
+class EnhancedQuestionGenerator:
     
-    def __init__(self, api_key: str = "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"):
+    def __init__(self, api_key: str = "AIzaSyCU4rOg50EuqY5MFm76-Wz9jLkwnOd9AQA"):
         self.api_key = api_key
         
     def generate_questions(self, context: str, num_questions: int = 3) -> List[Dict[str, str]]:
-        """Generate questions and answers using LLM."""
-        # Split very large contexts to process in parallel
+        """Generate questions using Google Gemini API."""
+        print(f"[DEBUG] Generating {num_questions} questions using Gemini API")
+        
+        # Process in chunks for long text
         if len(context) > 2000:
             chunks = [context[i:i+2000] for i in range(0, len(context), 1500)]
-            # Use ThreadPoolExecutor for parallel processing
-            with concurrent.futures.ThreadPoolExecutor() as executor:
-                results = list(executor.map(
-                    lambda chunk: self._generate_chunk_questions(chunk, num_questions//len(chunks) + 1),
-                    chunks
-                ))
-            # Combine and deduplicate results
             all_questions = []
-            for result in results:
-                all_questions.extend(result)
+            for chunk in chunks:
+                chunk_questions = self._generate_chunk_questions(chunk, num_questions//len(chunks) + 1)
+                all_questions.extend(chunk_questions)
             return all_questions[:num_questions]
         else:
             return self._generate_chunk_questions(context, num_questions)
-
+    
     def _generate_chunk_questions(self, chunk_text, count):
-        """Helper method for processing individual chunks."""
+        """Generate questions for a text chunk using Gemini."""
         if not self.api_key:
-            return []  # Fall back to existing methods if no API key
-
-        headers = {
-            "Authorization": f"Bearer {self.api_key}",
-            "HTTP-Referer": "https://mcq-generator.app",
-            "X-Title": "MCQ Generator",
-            "Content-Type": "application/json"
-        }
+            return []
         
-        # Updated prompt based on successful testing with Gemini model
-        prompt = (
-            f"As an experienced teacher creating a comprehension assessment, develop {count} "
-            f"multiple-choice questions based on this text:\n\n\"{chunk_text}\"\n\n"
-            f"Follow these educational principles:\n"
-            f"1. Create questions at different levels of Bloom's taxonomy (knowledge, comprehension, application, analysis)\n"
-            f"2. Include inference questions that require students to 'read between the lines'\n"
-            f"3. Ask about character motivations, central themes, and author's purpose where appropriate\n"
-            f"4. Vary question types: literal comprehension, vocabulary in context, and text structure\n"
-            f"5. Ensure questions assess genuine understanding rather than mere recall\n\n"
-            f"Format each as:\nQ: [question text]\nA: [correct answer]"
-        )
+        # Use the latest Gemini model
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-04-17:generateContent?key={self.api_key}"
+        
+        # Simplified, very explicit format instructions
+        prompt = f"""
+You are creating multiple-choice questions for a reading comprehension test.
+
+Text: "{chunk_text}"
+
+Generate EXACTLY {count} questions based on this text.
+
+Format MUST be:
+Q: [Question text]
+A: [Answer text - keep to 1-6 words if possible]
+
+Example:
+Q: What is the capital of France?
+A: Paris
+
+Q: Who wrote Romeo and Juliet?
+A: Shakespeare
+
+Your {count} questions:
+"""
         
         payload = {
-            "model": "google/gemini-2.0-flash-exp:free",  # Use the model that tested well
-            "messages": [{"role": "user", "content": prompt}],
-            "max_tokens": 500
+            "contents": [{
+                "parts": [{"text": prompt}]
+            }],
+            "generationConfig": {
+                "temperature": 0.2,  # Lower temperature for more reliable format
+                "topP": 0.95,
+                "maxOutputTokens": 1000
+            }
         }
         
         try:
-            print(f"[DEBUG] Sending LLM question generation request to OpenRouter")
-            resp = requests.post("https://openrouter.ai/api/v1/chat/completions", 
-                               headers=headers, json=payload)
+            print(f"[DEBUG] Sending request to Google Gemini API")
+            resp = requests.post(
+                url=url,
+                headers={"Content-Type": "application/json"},
+                json=payload,
+                timeout=15  # Add timeout to prevent hanging
+            )
             
-            print(f"[DEBUG] LLM question gen status={resp.status_code}")
+            print(f"[DEBUG] Google API response status={resp.status_code}")
             
             if resp.status_code == 200:
                 data = resp.json()
-                if "choices" in data and data["choices"]:
-                    text_out = data["choices"][0]["message"]["content"].strip()
+                
+                # Debug the raw response
+                if "candidates" in data and data["candidates"]:
+                    text_out = data["candidates"][0]["content"]["parts"][0]["text"].strip()
+                    print(f"[DEBUG] Raw response first 100 chars: {text_out[:100]}...")
                     
-                    # Parse the response into question-answer pairs
+                    # Simple, reliable parsing 
                     qa_pairs = []
-                    
-                    # Clean and parse the content
                     lines = text_out.split('\n')
+                    
                     i = 0
                     while i < len(lines):
                         line = lines[i].strip()
                         if line.startswith('Q:'):
                             question = line[2:].strip()
-                            if i+1 < len(lines) and lines[i+1].strip().startswith('A:'):
-                                answer = lines[i+1].strip()[2:].strip()
-                                qa_pairs.append({
-                                    "question": question,
-                                    "answer": answer
-                                })
-                            i += 2
+                            # Look for answer in next line or next few lines
+                            for j in range(i+1, min(i+4, len(lines))):
+                                if j < len(lines) and lines[j].strip().startswith('A:'):
+                                    answer = lines[j].strip()[2:].strip()
+                                    qa_pairs.append({
+                                        "question": question,
+                                        "answer": answer
+                                    })
+                                    i = j + 1
+                                    break
+                            else:
+                                i += 1
                         else:
                             i += 1
                     
-                    print(f"[DEBUG] LLM generated {len(qa_pairs)} questions")
+                    print(f"[DEBUG] Successfully parsed {len(qa_pairs)} questions from LLM")
                     return qa_pairs
         except Exception as e:
-            print(f"[DEBUG] LLM Q&A generation error: {e}")
+            print(f"[DEBUG] Error in generate_questions: {str(e)}")
         
         return []
 
@@ -115,3 +130,68 @@ class LLMQuestionGenerator:
         
         print(f"[DEBUG] Validated {len(valid_pairs)}/{len(qa_pairs)} questions")
         return valid_pairs
+
+
+class OnlineDistractionGenerator:
+    
+    def __init__(self, api_key: str = "AIzaSyCU4rOg50EuqY5MFm76-Wz9jLkwnOd9AQA"):
+        self.api_key = api_key
+    
+    def generate_online_distractors(self, correct: str, context: str, num_distractors: int, attempt=1) -> List[str]:
+        """Generate higher quality distractors using Google Gemini."""
+        if not self.api_key:
+            return []
+            
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-04-17:generateContent?key={self.api_key}"
+        
+        # Simplified prompt focused on clear formatting requirements
+        prompt = f"""
+Create {num_distractors} plausible but incorrect options for a multiple-choice question.
+
+Context: "{context}"
+Correct answer: "{correct}"
+
+Return ONLY a comma-separated list of {num_distractors} incorrect options:
+"""
+        
+        payload = {
+            "contents": [{
+                "parts": [{"text": prompt}]
+            }],
+            "generationConfig": {
+                "temperature": 0.3,
+                "topP": 0.95,
+                "maxOutputTokens": 500
+            }
+        }
+        
+        try:
+            resp = requests.post(
+                url=url,
+                headers={"Content-Type": "application/json"},
+                json=payload,
+                timeout=10
+            )
+            
+            if resp.status_code == 200:
+                data = resp.json()
+                if "candidates" in data and data["candidates"]:
+                    text_out = data["candidates"][0]["content"]["parts"][0]["text"].strip()
+                    
+                    # Print raw response for debugging
+                    print(f"[DEBUG] Raw distractor response: {text_out[:100]}...")
+                    
+                    # Handle both comma-separated and numbered formats
+                    if re.search(r'^\d+\.', text_out):
+                        # Numbered format
+                        cands = re.split(r'\d+\.\s*', text_out)
+                        cands = [c.strip() for c in cands if c.strip()]
+                    else:
+                        # Comma-separated format
+                        cands = [c.strip() for c in text_out.split(",") if c.strip()]
+                    
+                    return cands
+        except Exception as e:
+            print(f"[DEBUG] Distractor generation error: {str(e)}")
+            
+        return []
