@@ -52,8 +52,8 @@ An AI-powered application for automatically generating Multiple Choice Questions
    ```
 
 4. Download the models:
-   - [Question Generation Model (1.2GB)](https://drive.google.com/drive/folders/your_qa_model_folder) - Extract to `qa` directory
-   - [Distractor Generation Model (1.5GB)](https://drive.google.com/drive/folders/your_distractor_model_folder) - Extract to `distractor` directory
+   - [Question Generation Model (1.2GB)](https://drive.google.com/drive/folders/1jbMKWI2xwUFOxdTCBv3qiVGoyv-biiEb?usp=sharing) - Extract to `qa` directory
+   - [Distractor Generation Model (1.5GB)](https://drive.google.com/drive/folders/1mrEbzCwrVevZYY7hwrh3PmPy8nSBDhi4?usp=sharing) - Extract to `distractor` directory
    - [Sense2Vec Model (573MB)](https://github.com/explosion/sense2vec/releases/download/v1.0.0/s2v_reddit_2015_md.tar.gz) - Extract to `s2v_old` directory
 
 ### Frontend Setup
